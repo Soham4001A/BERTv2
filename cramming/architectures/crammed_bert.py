@@ -104,12 +104,24 @@ class TransformerLayer(torch.nn.Module):
         )
         self.LAYOUT = self.attn.LAYOUT
 
-        self.ffn = FFNComponent(
-            cfg_arch.hidden_size,
-            cfg_arch.intermed_size,
-            _get_nonlin_fn(cfg_arch.nonlin),
-            cfg_arch.use_bias,
-        )
+        # ── Feed‑forward network (outer FFN) ────────────────────────────
+        # For Latent Meta Attention we usually *omit* the full‑size FFN
+        # because an MLP already lives inside the latent transformer.
+        use_outer_ffn = True
+        if cfg_arch.attention.type == "lma":
+            # YAML knob: attention.use_outer_ffn  (default False for LMA)
+            use_outer_ffn = getattr(cfg_arch.attention, "use_outer_ffn", False)
+
+        if use_outer_ffn:
+            self.ffn = FFNComponent(
+                cfg_arch.hidden_size,
+                cfg_arch.intermed_size,
+                _get_nonlin_fn(cfg_arch.nonlin),
+                cfg_arch.use_bias,
+            )
+        else:
+            # Identity keeps the residual connection intact but costs nothing.
+            self.ffn = torch.nn.Identity()
 
     def forward(self, states, attention_mask: Optional[torch.Tensor] = None):
         states = states + self.dropout(self.attn(self.norm1(states), attention_mask))

@@ -154,6 +154,9 @@ class LMABertAttention(torch.nn.Module):
         # linear projections C_new ↔ d_new
         self.to_latent  = torch.nn.Linear(self.C_new, self.d_new,  bias=self.bias)
         self.from_latent= torch.nn.Linear(self.d_new, self.C_new,  bias=self.bias)
+        # --- ensure lazy‑constructed parameters live on the same device as the incoming tensor ---
+        self.to_latent  = self.to_latent.to(device)
+        self.from_latent= self.from_latent.to(device)
 
         # latent transformer blocks
         self.blocks = torch.nn.ModuleList([
@@ -161,6 +164,8 @@ class LMABertAttention(torch.nn.Module):
                       self.dropout, self.bias)
             for _ in range(self.n_layers)
         ])
+        # move latent blocks to the correct device
+        self.blocks = self.blocks.to(device)
 
         # cache constants for the inverse un‑stacking
         self.dk           = dk
