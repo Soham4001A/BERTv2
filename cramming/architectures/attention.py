@@ -61,21 +61,20 @@ class _LatentAttention(torch.nn.Module):
         q = q.view(B, L, self.nh, self.dk).transpose(1, 2)          # [B,nh,L,dk]
         k = k.view(B, L, self.nh, self.dk).transpose(1, 2)
         v = v.view(B, L, self.nh, self.dk).transpose(1, 2)
-        if self.flash:
+        # Use Flash‑SDPA only when no key‑padding mask is needed; otherwise fall back
+        if self.flash and mask is None:
             y = torch.nn.functional.scaled_dot_product_attention(
                     q, k, v,
-                    key_padding_mask=mask,          # NEW
                     dropout_p=self.at_drop.p if self.training else 0.0,
                     is_causal=False)
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / self.dk ** 0.5)
-            if mask is not None:                  # mask shape [B, L]
-                # Broadcast to [B, nh, L, 1] / [B, nh, 1, L]
+            if mask is not None:                    # mask shape [B, L]
                 att = att.masked_fill(mask[:, None, None, :], float("-inf"))
                 att = att.masked_fill(mask[:, None, :, None], float("-inf"))
             att = torch.nn.functional.softmax(att, dim=-1)
             att = self.at_drop(att)
-            y   = att @ v                                              # [B,nh,L,dk]
+            y   = att @ v
         y = y.transpose(1, 2).reshape(B, L, self.d_new)               # [B,L,d_new]
         return self.res_drop(self.c_proj(y))
 
