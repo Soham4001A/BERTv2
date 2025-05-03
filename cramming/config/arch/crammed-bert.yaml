@@ -41,7 +41,7 @@ attention:
   use_outer_ffn: False
 
   # ─── head stacking before the latent step ───
-  num_heads_stacking: 16    # how many standard heads to “stack” into one block
+  num_heads_stacking: 12    # how many standard heads to “stack” into one block
   qkv_bias: False
   dropout_prob: 0.1
   skip_output_projection: False  # keep the output Linear
