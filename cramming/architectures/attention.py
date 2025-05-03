@@ -145,7 +145,7 @@ class LMABertAttention(torch.nn.Module):
             # note: later .to(device) will move these params to GPU
 
         # modules built lazily because they depend on seq_len / C_new
-        self._built     = False
+        self._built = static_seq_len is not None
         self.output_dim = hidden_size
 
     # ---------------------------------------------------------------------
