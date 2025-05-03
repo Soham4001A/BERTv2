@@ -13,10 +13,10 @@ hidden_dropout_prob: 0.1
 norm: LayerNorm
 norm_eps: 1e-12
 norm_scheme: pre #"pre" is baked into the new implementation
-nonlin: GELUglu
+nonlin: GELU
 
 tie_weights: True # Tie input/output embedding
-decoder_bias: False # Whether to include a bias in the decoding step
+decoder_bias: True # Whether to include a bias in the decoding step
 
 sparse_prediction: ${train.objective.mlm_probability} # Whether to predict only on masked tokens, and how many there will be
 loss: cross-entropy
@@ -38,11 +38,11 @@ attention:
   # type: self_attention      # ← enable standard self-attention
   num_heads: 12           # number of attention heads
   causal_attention: False  # LMA is encoder‑style (leave this False)
-  use_outer_ffn: False
+  use_outer_ffn: True
 
   # ─── head stacking before the latent step ───
   num_heads_stacking: 12    # how many standard heads to “stack” into one block
-  qkv_bias: False
+  qkv_bias: True
   dropout_prob: 0.1
   skip_output_projection: False  # keep the output Linear
 
@@ -63,8 +63,8 @@ init:
 
 # Experimental options:
 ffn_layer_frequency: 1 # FFN layer in every layer
-skip_head_transform: True # This is only possible if embedding_dim=hidden_size
-use_bias: False # Whether to learn biases on all dense layers
+skip_head_transform: False # This is only possible if embedding_dim=hidden_size
+use_bias: True # Whether to learn biases on all dense layers
 final_norm: True # Add a final norm layer before the end
 
 # Downstream settings:
