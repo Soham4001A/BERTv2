@@ -5,12 +5,12 @@ from __future__ import annotations
 import math, torch
 from typing import Iterable, Optional, List
 from torch.optim.optimizer import Optimizer
-from typing import cast, List, Optional, Union
+from typing import cast, List, Optional, Union, Callable
 
 import torch
 from torch import Tensor
 
-from .optimizer import (
+from torch.optim.optimizer import (
     _default_to_fused_or_foreach,
     _device_dtype_check_for_fused,
     _differentiable_doc,
