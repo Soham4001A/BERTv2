@@ -548,7 +548,7 @@ def _load_optimizer(model, cfg_train, cfg_impl, initial_time):
     elif cfg_train.optim.type == "Sophia-G":
         optimizer_class = Sophia
     elif cfg_train.optim.type == "DAG":
-        from optimizers.DAG import DAG
+        from .optimizers import DAG
         optimizer_class = DAG
     elif cfg_train.optim.type == "Lion":
         from lion_pytorch import Lion

@@ -6,3 +6,4 @@ from .schedulers import get_schedule_fn
 from .nanoT5_optimizer import AdamWScale
 from .agd import AGD
 from .sophia import Sophia
+from .DAG import DAG
