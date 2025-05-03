@@ -55,7 +55,7 @@ class _LatentAttention(torch.nn.Module):
         self.at_drop = torch.nn.Dropout(dropout)
         self.res_drop= torch.nn.Dropout(dropout)
 
-    def forward(self, z):
+    def forward(self, z, mask: Optional[torch.Tensor] = None):
         B, L, _ = z.shape
         q, k, v = self.c_attn(z).chunk(3, dim=-1)                   # [B,L,d_new]×3
         q = q.view(B, L, self.nh, self.dk).transpose(1, 2)          # [B,nh,L,dk]
@@ -64,10 +64,15 @@ class _LatentAttention(torch.nn.Module):
         if self.flash:
             y = torch.nn.functional.scaled_dot_product_attention(
                     q, k, v,
+                    key_padding_mask=mask,          # NEW
                     dropout_p=self.at_drop.p if self.training else 0.0,
                     is_causal=False)
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / self.dk ** 0.5)
+            if mask is not None:                  # mask shape [B, L]
+                # Broadcast to [B, nh, L, 1] / [B, nh, 1, L]
+                att = att.masked_fill(mask[:, None, None, :], float("-inf"))
+                att = att.masked_fill(mask[:, None, :, None], float("-inf"))
             att = torch.nn.functional.softmax(att, dim=-1)
             att = self.at_drop(att)
             y   = att @ v                                              # [B,nh,L,dk]
@@ -96,8 +101,8 @@ class _LMABlock(torch.nn.Module):
         self.attn = _LatentAttention(d_new, num_heads, dropout, bias)
         self.ln2  = _LayerNorm(d_new, bias)
         self.mlp  = _LatentMLP(d_new, ff_hidden, dropout, bias)
-    def forward(self, z):
-        z = z + self.attn(self.ln1(z))
+    def forward(self, z, mask: Optional[torch.Tensor] = None):
+        z = z + self.attn(self.ln1(z), mask)
         z = z + self.mlp(self.ln2(z))
         return z
 
@@ -186,10 +191,19 @@ class LMABertAttention(torch.nn.Module):
                 attention_mask: Optional[torch.Tensor] = None):
         """
         hidden_states : Tensor [B,S,H]
-        attention_mask is ignored — masking would require mapping the mask
-        through the same reshaping steps.
+        attention_mask: [B,1,1,S] (HuggingFace style, 0/-inf), or [B,S] binary, or [B,1,S]
         """
         B, S, H = hidden_states.shape
+        mask = None
+        if attention_mask is not None:
+            # Convert Hugging‑Face style mask ([B,1,1,S] with 0/‑inf) or [B,S] binary to [B,S,1] float
+            if attention_mask.dim() == 4:                    # [B,1,1,S]
+                mask = (attention_mask > -0.5).float().squeeze(1).squeeze(1)  # [B,S]
+            else:                                            # [B,S] or [B,1,S]
+                mask = attention_mask.float().view(B, S)
+            mask = mask.unsqueeze(-1)                        # [B,S,1]
+            hidden_states = hidden_states * mask             # zero‑out PAD token embeddings
+
         if not self._built:
             self._build(S, hidden_states.device)
         elif S != self.seq_len:
@@ -199,6 +213,10 @@ class LMABertAttention(torch.nn.Module):
         # --- Stage 2a : head‑stacking --------------------------------------
         dk = self.dk
         head_views  = torch.split(hidden_states, dk, dim=2)      # list len=nh_stack
+        # propagate padding mask through the same reshape pipeline
+        if mask is not None:
+            mask_views = torch.split(mask, dk, dim=2)           # list len=nh_stack
+            m_stacked   = torch.cat(mask_views, dim=1)          # [B,S*nh,1]
         x_stacked   = torch.cat(head_views, dim=1)               # [B,S*nh_stack,dk]
         x_stacked   = x_stacked * (1.0 / self.nh_stack**0.5)  # ← keep variance ~constant
 
@@ -207,9 +225,17 @@ class LMABertAttention(torch.nn.Module):
         x_chunks    = flat.view(B, self.L_new, self.C_new)       # [B,L_new,C_new]
         z           = self.to_latent(x_chunks)                   # [B,L_new,d_new]
 
+        # propagate mask through rechunk
+        if mask is not None:
+            flat_mask  = m_stacked.view(B, -1)                  # [B,S*H]
+            mask_chunks= flat_mask.view(B, self.L_new, self.C_new)
+            latent_mask= (mask_chunks.sum(dim=-1) == 0)         # True if all pad
+        else:
+            latent_mask = None
+
         # --- Latent transformer ------------------------------------------
         for blk in self.blocks:
-            z = blk(z)
+            z = blk(z, latent_mask)
 
         # --- Project back & inverse reshape ------------------------------
         chunks_back = self.from_latent(z)                        # [B,L_new,C_new]
@@ -219,6 +245,8 @@ class LMABertAttention(torch.nn.Module):
         # inverse head stacking
         x_unstacked = x_stacked_b.view(B, self.seq_len, self.nh_stack, dk)
         out         = torch.cat(torch.unbind(x_unstacked, dim=2), dim=2)  # [B,S,H]
+        if attention_mask is not None:
+            out = out * mask        # keep PAD rows at zero so downstream layers ignore them
         return out
 
 
