@@ -2,6 +2,207 @@
 import torch
 from transformers.models.bert.modeling_bert import BertSelfAttention
 
+# ────────────────────────────────────────────────────────────────────────────
+# Latent Meta Attention – NLP variant
+# Ports the RL implementation to '[B,S,H]' tensors used in BERT.
+# ────────────────────────────────────────────────────────────────────────────
+import types
+
+def _find_closest_divisor(n: int, target: int) -> int:
+    """
+    Find a divisor of n that is as close as possible to 'target'.
+    Guarantees the return value divides n.
+    """
+    if n % target == 0:
+        return target
+    # scan outwards from target
+    for offset in range(1, n):
+        lo = target - offset
+        hi = target + offset
+        if lo > 0 and n % lo == 0:
+            return lo
+        if hi <= n and n % hi == 0:
+            return hi
+    return 1  # fallback (n is divisible by 1)
+
+class _LayerNorm(torch.nn.Module):
+    """Simple LayerNorm (bias optional) — duplicated to avoid circular import."""
+    def __init__(self, dim: int, bias: bool = True):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(dim))
+        self.bias   = torch.nn.Parameter(torch.zeros(dim)) if bias else None
+    def forward(self, x):
+        return torch.nn.functional.layer_norm(x, self.weight.shape,
+                                              self.weight,
+                                              self.bias, 1e-5)
+
+# ---- Latent‑space primitives copied from the RL version -------------------
+class _LatentAttention(torch.nn.Module):
+    """Multi‑head attention operating in latent '[B,L_new,d_new]' space."""
+    def __init__(self, d_new: int, num_heads: int, dropout: float, bias: bool):
+        super().__init__()
+        assert d_new % num_heads == 0, "d_new must be divisible by num_heads"
+        self.d_new   = d_new
+        self.nh      = num_heads
+        self.dk      = d_new // num_heads
+        self.flash   = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+        self.c_attn  = torch.nn.Linear(d_new, 3 * d_new, bias=bias)
+        self.c_proj  = torch.nn.Linear(d_new, d_new, bias=bias)
+        self.at_drop = torch.nn.Dropout(dropout)
+        self.res_drop= torch.nn.Dropout(dropout)
+
+    def forward(self, z):
+        B, L, _ = z.shape
+        q, k, v = self.c_attn(z).chunk(3, dim=-1)                   # [B,L,d_new]×3
+        q = q.view(B, L, self.nh, self.dk).transpose(1, 2)          # [B,nh,L,dk]
+        k = k.view(B, L, self.nh, self.dk).transpose(1, 2)
+        v = v.view(B, L, self.nh, self.dk).transpose(1, 2)
+        if self.flash:
+            y = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v,
+                    dropout_p=self.at_drop.p if self.training else 0.0,
+                    is_causal=False)
+        else:
+            att = (q @ k.transpose(-2, -1)) * (1.0 / self.dk ** 0.5)
+            att = torch.nn.functional.softmax(att, dim=-1)
+            att = self.at_drop(att)
+            y   = att @ v                                              # [B,nh,L,dk]
+        y = y.transpose(1, 2).reshape(B, L, self.d_new)               # [B,L,d_new]
+        return self.res_drop(self.c_proj(y))
+
+class _LatentMLP(torch.nn.Module):
+    """Feed‑forward network in latent space."""
+    def __init__(self, d_new: int, hidden: int, dropout: float, bias: bool):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(d_new, hidden, bias=bias),
+            torch.nn.GELU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden, d_new, bias=bias),
+            torch.nn.Dropout(dropout),
+        )
+    def forward(self, x): return self.net(x)
+
+class _LMABlock(torch.nn.Module):
+    """A single transformer block in latent space."""
+    def __init__(self, d_new: int, num_heads: int, ff_hidden: int,
+                 dropout: float, bias: bool):
+        super().__init__()
+        self.ln1  = _LayerNorm(d_new, bias)
+        self.attn = _LatentAttention(d_new, num_heads, dropout, bias)
+        self.ln2  = _LayerNorm(d_new, bias)
+        self.mlp  = _LatentMLP(d_new, ff_hidden, dropout, bias)
+    def forward(self, z):
+        z = z + self.attn(self.ln1(z))
+        z = z + self.mlp(self.ln2(z))
+        return z
+
+# ---- Main module plugged into BERT ----------------------------------------
+class LMABertAttention(torch.nn.Module):
+    """
+    Latent Meta Attention module for BERT.
+    Steps   : 1) head‑stacking, 2) re‑chunking to latent '[L_new,C_new]',
+              3) Linear → d_new, 4) N latent blocks, 5) Linear → C_new,
+              6) inverse re‑chunk & un‑stack back to '[B,S,H]'.
+    Config  : supply the following attributes inside cfg_attention
+              ─ num_heads_stacking  (int, default 4)
+              ─ target_l_new        (int, optional, default S//2)
+              ─ d_new               (int, default H//2)
+              ─ num_heads_latent    (int, default 4)
+              ─ ff_latent_hidden    (int, default 4*d_new)
+              ─ num_lma_layers      (int, default 2)
+              ─ dropout_prob, qkv_bias (already present)
+    """
+    __constants__ = ["LAYOUT"]
+    LAYOUT = "[B S H]"
+
+    def __init__(self, hidden_size: int, cfg_attention):
+        super().__init__()
+        # hyper‑parameters from cfg_attention
+        self.hidden_size        = hidden_size
+        self.nh_stack           = int(getattr(cfg_attention, "num_heads_stacking", 4))
+        self.d_new              = int(getattr(cfg_attention, "d_new", hidden_size // 2))
+        self.nh_latent          = int(getattr(cfg_attention, "num_heads_latent", 4))
+        self.ff_latent_hidden   = int(getattr(cfg_attention, "ff_latent_hidden", 4 * self.d_new))
+        self.n_layers           = int(getattr(cfg_attention, "num_lma_layers", 2))
+        self.target_l_new_cfg   = getattr(cfg_attention, "target_l_new", None)
+        self.dropout            = cfg_attention.dropout_prob
+        self.bias               = cfg_attention.qkv_bias
+
+        if hidden_size % self.nh_stack != 0:
+            raise ValueError(f"hidden_size {hidden_size} not divisible by num_heads_stacking {self.nh_stack}")
+
+        # modules built lazily because they depend on seq_len / C_new
+        self._built          = False
+        self.output_dim      = hidden_size  # required by AttentionComponent
+
+    # ---------------------------------------------------------------------
+    def _build(self, seq_len: int, device: torch.device):
+        """Create sub‑modules for a fixed sequence length."""
+        dk              = self.hidden_size // self.nh_stack          # per‑head dim after stacking
+        total_features  = seq_len * self.hidden_size                 # S*H
+        target_l_new    = (self.target_l_new_cfg
+                           if self.target_l_new_cfg is not None
+                           else max(2, seq_len // 2))
+        self.L_new      = _find_closest_divisor(total_features, target_l_new)
+        self.C_new      = total_features // self.L_new
+
+        # linear projections C_new ↔ d_new
+        self.to_latent  = torch.nn.Linear(self.C_new, self.d_new,  bias=self.bias)
+        self.from_latent= torch.nn.Linear(self.d_new, self.C_new,  bias=self.bias)
+
+        # latent transformer blocks
+        self.blocks = torch.nn.ModuleList([
+            _LMABlock(self.d_new, self.nh_latent, self.ff_latent_hidden,
+                      self.dropout, self.bias)
+            for _ in range(self.n_layers)
+        ])
+
+        # cache constants for the inverse un‑stacking
+        self.dk           = dk
+        self.seq_len      = seq_len
+        self.register_buffer("_dummy", torch.empty(0, device=device))  # to track device
+        self._built       = True
+
+    # ---------------------------------------------------------------------
+    def forward(self, hidden_states: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None):
+        """
+        hidden_states : Tensor [B,S,H]
+        attention_mask is ignored — masking would require mapping the mask
+        through the same reshaping steps.
+        """
+        B, S, H = hidden_states.shape
+        if not self._built:
+            self._build(S, hidden_states.device)
+        elif S != self.seq_len:
+            raise RuntimeError(f"LMABertAttention was built for seq_len={self.seq_len} "
+                               f"but got {S}")
+
+        # --- Stage 2a : head‑stacking --------------------------------------
+        dk = self.dk
+        head_views  = torch.split(hidden_states, dk, dim=2)      # list len=nh_stack
+        x_stacked   = torch.cat(head_views, dim=1)               # [B,S*nh_stack,dk]
+
+        # --- Stage 2b : re‑chunk & project to latent ----------------------
+        flat        = x_stacked.view(B, -1)                      # [B,S*H]
+        x_chunks    = flat.view(B, self.L_new, self.C_new)       # [B,L_new,C_new]
+        z           = self.to_latent(x_chunks)                   # [B,L_new,d_new]
+
+        # --- Latent transformer ------------------------------------------
+        for blk in self.blocks:
+            z = blk(z)
+
+        # --- Project back & inverse reshape ------------------------------
+        chunks_back = self.from_latent(z)                        # [B,L_new,C_new]
+        flat_back   = chunks_back.reshape(B, -1)                 # [B,S*H]
+        x_stacked_b = flat_back.view(B, S * self.nh_stack, dk)   # [B,S*nh,dk]
+
+        # inverse head stacking
+        x_unstacked = x_stacked_b.view(B, self.seq_len, self.nh_stack, dk)
+        out         = torch.cat(torch.unbind(x_unstacked, dim=2), dim=2)  # [B,S,H]
+        return out
+
 from .embeddings import Rotary, RotarySanityCheck, RotaryEleutherAI, RotaryLLAMA
 from typing import Optional
 from einops.layers.torch import Rearrange
@@ -46,6 +247,8 @@ def get_attention_mechanism(
             mechanism = SeqFirstSelfAttention(hidden_size, cfg_attention)
         else:
             mechanism = FourierMixing(hidden_size, cfg_attention)
+    elif cfg_attention.type == "lma":
+        mechanism = LMABertAttention(hidden_size, cfg_attention)
     else:
         raise ValueError(f"Invalid attention type {cfg_attention.type} given.")
     return mechanism
@@ -852,3 +1055,281 @@ class CumsumExp(torch.nn.Module):
         if self.seq_op_in_fp32:
             inputs = inputs.to(dtype=torch.float)
         return (inputs.logcumsumexp(dim=-1) * pow(inputs.shape[2], -0.5)).to(dtype=input_dtype)
+
+
+# import numpy as np
+# import torch
+# import torch.nn as nn
+# from torch.nn import functional as F
+# import math
+# from dataclasses import dataclass, field
+# from matplotlib.animation import FuncAnimation
+# import matplotlib.pyplot as plt
+# from mpl_toolkits.mplot3d import Axes3D
+# from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+# #===============================================
+# # LMA Feature Extractor Implementation
+# #===============================================
+
+# @dataclass
+# class LMAConfigRL:
+#     """ Config for LMA Feature Extractor """
+#     seq_len: int             # Input sequence length (L, e.g., 6)
+#     embed_dim: int           # Initial embedding dim (d0)
+#     num_heads_stacking: int  # Heads for stacking (nh)
+#     target_l_new: int        # Target latent sequence length
+#     d_new: int               # Latent embedding dim
+#     num_heads_latent: int    # Heads for latent attention
+
+#     # Derived values
+#     L_new: int = field(init=False) # Actual latent sequence length
+#     C_new: int = field(init=False) # Latent chunk size
+
+#     def __post_init__(self):
+#         if self.seq_len <= 0 or self.embed_dim <= 0 or self.num_heads_stacking <= 0 or \
+#            self.target_l_new <= 0 or self.d_new <= 0 or self.num_heads_latent <= 0:
+#             raise ValueError("LMAConfigRL inputs must be positive.")
+#         if self.embed_dim % self.num_heads_stacking != 0:
+#             raise ValueError(f"LMA embed_dim ({self.embed_dim}) not divisible by num_heads_stacking ({self.num_heads_stacking})")
+#         if self.d_new % self.num_heads_latent != 0:
+#             raise ValueError(f"LMA d_new ({self.d_new}) not divisible by num_heads_latent ({self.num_heads_latent})")
+
+#         total_features = self.seq_len * self.embed_dim
+#         if total_features == 0: raise ValueError("LMA total features cannot be zero.")
+
+#         try:
+#             self.L_new = find_closest_divisor(total_features, self.target_l_new)
+#             if self.L_new != self.target_l_new:
+#                  print(f"LMAConfigRL ADJUSTMENT: L_new {self.target_l_new} -> {self.L_new}")
+#             if self.L_new <= 0: raise ValueError("Calculated L_new is not positive.")
+#             if total_features % self.L_new != 0:
+#                 raise RuntimeError(f"Internal Error: total_features ({total_features}) not divisible by final L_new ({self.L_new})")
+#             self.C_new = total_features // self.L_new
+#             if self.C_new <= 0: raise ValueError("Calculated C_new is not positive.")
+#         except ValueError as e:
+#             raise ValueError(f"LMA Config Error calculating L_new/C_new: {e}") from e
+
+# class LayerNorm(nn.Module):
+#     """ LayerNorm with optional bias """
+#     def __init__(self, ndim, bias=True):
+#         super().__init__()
+#         self.weight = nn.Parameter(torch.ones(ndim))
+#         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+#     def forward(self, input):
+#         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+# class LMA_InitialTransform_RL(nn.Module):
+#     """ Performs LMA Stage 1 and Stage 2 (Stacking, Rechunking, Latent Embed) """
+#     def __init__(self, features_per_step: int, lma_config: LMAConfigRL, dropout: float, bias: bool):
+#         super().__init__()
+#         self.lma_config = lma_config
+#         self.dropout_p = dropout
+#         self.bias = bias
+
+#         # Stage 1 equivalent: Project features per step to embed_dim (d0)
+#         self.input_embedding = nn.Linear(features_per_step, lma_config.embed_dim, bias=self.bias)
+#         self.input_embedding_act = nn.ReLU() # Activation defined
+#         self.embedding_dropout = nn.Dropout(p=self.dropout_p)
+
+#         # Stage 2b: Latent Embedding Layer (maps C_new -> d_new)
+#         self.embed_layer_2 = nn.Linear(lma_config.C_new, lma_config.d_new, bias=self.bias)
+#         # Using ReLU here as requested (instead of GELU in prev version)
+#         self.embed_layer_2_act = nn.ReLU()
+
+#         print("  LMA_InitialTransform_RL Initialized:")
+#         print(f"    Input features/step: {features_per_step}")
+#         print(f"    Stage 1 Projection: Linear({features_per_step} -> {lma_config.embed_dim}) + ReLU") # Updated print
+#         print(f"    Head Stacking: {lma_config.num_heads_stacking} heads")
+#         print(f"    Rechunking: L={lma_config.seq_len}, d0={lma_config.embed_dim} -> L_new={lma_config.L_new}, C_new={lma_config.C_new}")
+#         print(f"    Stage 2b Projection: Linear({lma_config.C_new} -> {lma_config.d_new}) + ReLU") # Updated print
+
+#     def forward(self, x):
+#         # Input x shape: (B, L, features_per_step)
+#         B, L, _ = x.shape
+#         if L != self.lma_config.seq_len:
+#             raise ValueError(f"Input sequence length {L} doesn't match LMA config seq_len {self.lma_config.seq_len}")
+
+#         # --- Stage 1 ---
+#         y = self.input_embedding(x) # (B, L, Feat/L) -> (B, L, d0)
+#         y = self.input_embedding_act(y) # *** APPLY ACTIVATION HERE ***
+#         y = y + self._positional_encoding(L, self.lma_config.embed_dim).to(y.device)
+#         y = self.embedding_dropout(y) # (B, L, d0)
+
+#         # --- Stage 2a: Head-View Stacking ---
+#         d0 = self.lma_config.embed_dim
+#         nh = self.lma_config.num_heads_stacking
+#         dk = d0 // nh
+#         try:
+#             head_views = torch.split(y, dk, dim=2)
+#             x_stacked = torch.cat(head_views, dim=1) # (B, L*nh, dk)
+#         except Exception as e:
+#             raise RuntimeError(f"Error during head stacking: Input={y.shape}, d0={d0}, nh={nh}, dk={dk}") from e
+
+#         # --- Stage 2b: Re-Chunking & Latent Embedding ---
+#         L_new = self.lma_config.L_new
+#         C_new = self.lma_config.C_new
+#         expected_flat_dim = L * d0
+
+#         x_flat = x_stacked.view(B, -1) # (B, L*d0)
+#         if x_flat.shape[1] != expected_flat_dim:
+#              raise RuntimeError(f"Flattened shape mismatch: Expected {expected_flat_dim}, got {x_flat.shape[1]}")
+
+#         try: x_rechunked = x_flat.view(B, L_new, C_new) # (B, L_new, C_new)
+#         except RuntimeError as e: raise RuntimeError(f"Error rechunking: Flat={x_flat.shape}, Target=({B}, {L_new}, {C_new})") from e
+
+#         z_embedded = self.embed_layer_2(x_rechunked) # (B, L_new, d_new)
+#         z = self.embed_layer_2_act(z_embedded) # Apply activation
+
+#         return z # Return latent representation
+
+#     def _positional_encoding(self, seq_len, embed_dim):
+#         # (Keep positional encoding function as before)
+#         position = torch.arange(seq_len, dtype=torch.float).unsqueeze(1)
+#         div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
+#         pe = torch.zeros(seq_len, embed_dim)
+#         pe[:, 0::2] = torch.sin(position * div_term)
+#         pe[:, 1::2] = torch.cos(position * div_term)
+#         return pe
+
+# class LatentAttention_RL(nn.Module):
+#     """ MHA operating in the LMA latent space (Non-Causal) """
+#     def __init__(self, d_new: int, num_heads_latent: int, dropout: float, bias: bool):
+#         super().__init__()
+#         assert d_new % num_heads_latent == 0
+#         self.d_new = d_new
+#         self.num_heads = num_heads_latent
+#         self.head_dim = d_new // num_heads_latent
+#         self.dropout_p = dropout
+#         self.bias = bias
+
+#         self.c_attn = nn.Linear(d_new, 3 * d_new, bias=self.bias)
+#         self.c_proj = nn.Linear(d_new, d_new, bias=self.bias)
+#         self.attn_dropout = nn.Dropout(self.dropout_p)
+#         self.resid_dropout = nn.Dropout(self.dropout_p)
+#         self.flash = hasattr(F, 'scaled_dot_product_attention')
+#         if self.flash: print(f"    - LatentAttention_RL: Using Flash Attention (d_new={d_new})")
+#         else: print(f"    - LatentAttention_RL: Using slow attention path.")
+
+#     def forward(self, z):
+#         B, L_new, C = z.size()
+#         if C != self.d_new: raise ValueError(f"LatentAttention C mismatch")
+#         q, k, v = self.c_attn(z).split(self.d_new, dim=2)
+#         q = q.view(B, L_new, self.num_heads, self.head_dim).transpose(1, 2)
+#         k = k.view(B, L_new, self.num_heads, self.head_dim).transpose(1, 2)
+#         v = v.view(B, L_new, self.num_heads, self.head_dim).transpose(1, 2)
+#         if self.flash:
+#             y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout_p if self.training else 0, is_causal=False)
+#         else:
+#             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+#             att = F.softmax(att, dim=-1)
+#             att = self.attn_dropout(att)
+#             y = att @ v
+#         y = y.transpose(1, 2).contiguous().view(B, L_new, self.d_new)
+#         y = self.resid_dropout(self.c_proj(y))
+#         return y
+
+# class LatentMLP_RL(nn.Module):
+#     """ MLP operating in the latent space dimension d_new """
+#     def __init__(self, d_new: int, ff_latent_hidden: int, dropout: float, bias: bool):
+#         super().__init__()
+#         self.c_fc    = nn.Linear(d_new, ff_latent_hidden, bias=bias)
+#         self.gelu    = nn.GELU()
+#         self.c_proj  = nn.Linear(ff_latent_hidden, d_new, bias=bias)
+#         self.dropout = nn.Dropout(dropout)
+
+#     def forward(self, x):
+#         x = self.c_fc(x); x = self.gelu(x); x = self.c_proj(x); x = self.dropout(x)
+#         return x
+
+# class LMABlock_RL(nn.Module):
+#     """ A single LMA block operating in the latent space """
+#     def __init__(self, lma_config: LMAConfigRL, ff_latent_hidden: int, dropout: float, bias: bool):
+#         super().__init__()
+#         self.ln_1 = LayerNorm(lma_config.d_new, bias=bias)
+#         self.attn = LatentAttention_RL(lma_config.d_new, lma_config.num_heads_latent, dropout, bias)
+#         self.ln_2 = LayerNorm(lma_config.d_new, bias=bias)
+#         self.mlp = LatentMLP_RL(lma_config.d_new, ff_latent_hidden, dropout, bias)
+
+#     def forward(self, z):
+#         z = z + self.attn(self.ln_1(z))
+#         z = z + self.mlp(self.ln_2(z))
+#         return z
+
+# class LMAFeaturesExtractor(BaseFeaturesExtractor):
+#     """ Feature extractor using the original LMA mechanism """
+#     def __init__(
+#         self,
+#         observation_space,
+#         embed_dim=64, num_heads_stacking=4, target_l_new=3, d_new=32,
+#         num_heads_latent=4, ff_latent_hidden=64, num_lma_layers=2,
+#         seq_len=6, dropout=0.1, bias=True
+#     ):
+#         print("\n--- Initializing LMAFeaturesExtractor ---")
+#         print("Calculating LMA dimensions...")
+#         self.lma_config = LMAConfigRL(
+#             seq_len=seq_len, embed_dim=embed_dim, num_heads_stacking=num_heads_stacking,
+#             target_l_new=target_l_new, d_new=d_new, num_heads_latent=num_heads_latent
+#         )
+#         print(f"  Final LMA Config: L={self.lma_config.seq_len}, d0={self.lma_config.embed_dim}, nh_stack={self.lma_config.num_heads_stacking}")
+#         print(f"                    L_new={self.lma_config.L_new}, C_new={self.lma_config.C_new}, d_new={self.lma_config.d_new}, nh_latent={self.lma_config.num_heads_latent}")
+
+#         feature_dim = self.lma_config.L_new * self.lma_config.d_new
+#         super().__init__(observation_space, features_dim=feature_dim)
+#         print(f"  SB3 features_dim (Flattened L_new * d_new): {feature_dim}")
+
+#         self.input_dim_total = observation_space.shape[0]
+#         self.seq_len = seq_len
+#         if self.input_dim_total % seq_len != 0:
+#             raise ValueError(f"Input dimension ({self.input_dim_total}) must be divisible by seq_len ({seq_len}).")
+#         self.features_per_step = self.input_dim_total // seq_len
+
+#         self.initial_transform = LMA_InitialTransform_RL(
+#             features_per_step=self.features_per_step,
+#             lma_config=self.lma_config, dropout=dropout, bias=bias
+#         )
+#         self.lma_blocks = nn.ModuleList([
+#             LMABlock_RL(
+#                 lma_config=self.lma_config, ff_latent_hidden=ff_latent_hidden,
+#                 dropout=dropout, bias=bias
+#             ) for _ in range(num_lma_layers)
+#         ])
+#         print(f"  Number of LMA Blocks: {num_lma_layers}")
+#         self.flatten = nn.Flatten()
+#         print("-----------------------------------------")
+
+#     def forward(self, x):
+#         batch_size = x.shape[0]
+#         try:
+#              x_reshaped = x.view(batch_size, self.seq_len, self.features_per_step)
+#         except RuntimeError as e:
+#              raise RuntimeError(f"Error reshaping input: Input={x.shape}, Target=({batch_size},{self.seq_len},{self.features_per_step})") from e
+#         z = self.initial_transform(x_reshaped)
+#         for block in self.lma_blocks:
+#             z = block(z)
+#         features = self.flatten(z)
+#         return features
+
+# #===============================================
+# # Example Usage
+# #===============================================
+# if __name__ == "__main__":
+
+#         # Define LMA hyperparameters for testing
+#         lma_kwargs = dict(
+#             embed_dim=32,           # d0
+#             num_heads_stacking=4,   # nh (32 % 4 == 0) -> dk=8
+#             target_l_new=3,         # Target L_new (L=6) -> L_new=3 (since 6*32 % 3 == 0)
+#             d_new=24,               # d_new
+#             num_heads_latent=4,     # Latent heads (24 % 4 == 0) -> latent_dk=6
+#             ff_latent_hidden=48,    # Latent MLP hidden (2*d_new)
+#             num_lma_layers=2,
+#             seq_len=obs_hist_len,
+#             dropout=0.1,
+#             bias=True
+#         )
+
+#         lma_extractor = LMAFeaturesExtractor(
+#             observation_space=dummy_obs_space,
+#             **lma_kwargs
+#         )

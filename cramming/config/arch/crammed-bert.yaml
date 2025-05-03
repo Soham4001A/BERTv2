@@ -33,17 +33,30 @@ embedding:
   stable_low_precision: False
 
 attention:
-  type: self-attention # also works with "pytorch"
-  causal_attention: False
-  num_attention_heads: 12
-  dropout_prob: 0.1
-  skip_output_projection: False
+  # ───────────── core switch ─────────────
+  type: lma                # ← enable Latent Meta Attention
+  # type: self_attention      # ← enable standard self-attention
+  num_heads: 12           # number of attention heads
+  causal_attention: False  # LMA is encoder‑style (leave this False)
+  use_outer_ffn: False
+
+  # ─── head stacking before the latent step ───
+  num_heads_stacking: 16    # how many standard heads to “stack” into one block
   qkv_bias: False
+  dropout_prob: 0.1
+  skip_output_projection: False  # keep the output Linear
 
+  # ───────────── latent‑space hyper‑params ─────────────
+  d_new: 384               # size of each latent token (≈ hidden_size / 2)
+  target_l_new: 64         # desired latent sequence length (≈ S / 2)
+  num_heads_latent: 8      # heads inside each latent block
+  num_lma_layers: 1        # how many latent transformer blocks to run
+  ff_latent_hidden: 1536   # inner size of the latent MLP (≈ 4 × d_new)
+
+  # ───────────── misc options ─────────────
   rotary_embedding: False
-  seq_op_in_fp32: False # whether to always cast the operation over the sequence into fp32 (e.g.. the softmax in normal attn)
-  sequence_op: torch-softmax # Can be normalization
-
+  seq_op_in_fp32: False
+  sequence_op: torch-softmax
 init:
   type: normal
   std: 0.02
