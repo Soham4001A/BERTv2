@@ -37,10 +37,13 @@ attention:
   type: self-attention      # ← enable standard self-attention
   num_attention_heads: 12     # for standard self-attention
 
+  use_outer_ffn: True # whether to use the outer FFN in the attention block (only for MHA)
+  # ───────────── LMA switch ─────────────
+
   # type: lma                # ← enable Latent Meta Attention
   # num_heads: 12           # number of attention heads
   causal_attention: False  # LMA is encoder‑style (leave this False)
-  use_outer_ffn: True
+
 
   # ─── head stacking before the latent step ───
   num_heads_stacking: 12    # how many standard heads to “stack” into one block

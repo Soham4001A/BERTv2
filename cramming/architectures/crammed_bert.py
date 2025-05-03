@@ -124,16 +124,15 @@ class TransformerLayer(torch.nn.Module):
             self.ffn = torch.nn.Identity()
 
     def forward(self, states, attention_mask: Optional[torch.Tensor] = None):
-        # --- Revert to Pre-LN sequence ---
-        # Pass normed states into attention
-        attn_output = self.attn(self.norm1(states), attention_mask)
-        # Add residual connection
-        states = states + self.dropout(attn_output)
+        # Pre-LN for Attention
+        normed_states_for_attn = self.norm1(states)
+        attn_output = self.attn(normed_states_for_attn, attention_mask)
+        states = states + self.dropout(attn_output) # Residual connection 1
 
-        # Pass normed states into FFN
-        ffn_output = self.ffn(self.norm2(states))
-        # Add residual connection
-        states = states + self.dropout(ffn_output)
+        # Pre-LN for FFN
+        normed_states_for_ffn = self.norm2(states)
+        ffn_output = self.ffn(normed_states_for_ffn)
+        states = states + self.dropout(ffn_output) # Residual connection 2
 
         return states
 
