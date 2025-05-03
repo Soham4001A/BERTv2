@@ -50,7 +50,7 @@ attention:
   d_new: 384               # size of each latent token (≈ hidden_size / 2)
   target_l_new: 64         # desired latent sequence length (≈ S / 2)
   static_seq_len: 128      # pre‑build LMA once for this sequence length
-  num_heads_latent: 8      # heads inside each latent block
+  num_heads_latent: 12      # heads inside each latent block
   num_blocks: 1            # how many latent transformer blocks per layer (we need better convetion for this)
   ff_latent_hidden: 1536   # inner size of the latent MLP (≈ 4 × d_new)
 
