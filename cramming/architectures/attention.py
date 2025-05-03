@@ -62,20 +62,32 @@ class _LatentAttention(torch.nn.Module):
         k = k.view(B, L, self.nh, self.dk).transpose(1, 2)
         v = v.view(B, L, self.nh, self.dk).transpose(1, 2)
         # Use Flash‑SDPA only when no key‑padding mask is needed; otherwise fall back
-        if self.flash and mask is None:
+        if self.flash: # Use SDPA if available
+            # SDPA key_padding_mask expects [B, L_key_seq] boolean where True means MASK
+            # Your latent_mask is [B, L], boolean, True means MASK. Perfect match.
             y = torch.nn.functional.scaled_dot_product_attention(
                     q, k, v,
+                    attn_mask=None, # Not needed for standard padding
                     dropout_p=self.at_drop.p if self.training else 0.0,
-                    is_causal=False)
-        else:
+                    is_causal=False,
+                    # Use the key_padding_mask argument when mask is provided
+                    # Needs boolean mask where True indicates padding/masking
+                    key_padding_mask=mask if mask is not None else None # Pass mask directly
+                    )
+        else: # Manual path only if flash/SDPA is not available
             att = (q @ k.transpose(-2, -1)) * (1.0 / self.dk ** 0.5)
-            if mask is not None:                    # mask shape [B, L]
+            if mask is not None:                    # mask shape [B, L] (boolean, True=MASK)
+                # Mask attention *to* padded keys (columns)
                 att = att.masked_fill(mask[:, None, None, :], float("-inf"))
-                att = att.masked_fill(mask[:, None, :, None], float("-inf"))
+                # OPTIONAL BUT RECOMMENDED: Mask attention *from* padded queries (rows)
+                # This prevents padded queries from contributing weirdness, even if small
+                att = att.masked_fill(mask[:, None, :, None], float("-inf")) # Add this line
             att = torch.nn.functional.softmax(att, dim=-1)
+            # Apply dropout *after* softmax
             att = self.at_drop(att)
             y   = att @ v
-        y = y.transpose(1, 2).reshape(B, L, self.d_new)               # [B,L,d_new]
+
+        y = y.transpose(1, 2).reshape(B, L, self.d_new)
         return self.res_drop(self.c_proj(y))
 
 class _LatentMLP(torch.nn.Module):
@@ -226,15 +238,15 @@ class LMABertAttention(torch.nn.Module):
 
         # propagate mask through rechunk
         if mask is not None:
-            flat_mask  = m_stacked.view(B, -1)                  # [B,S*H]
-            mask_chunks= flat_mask.view(B, self.L_new, self.C_new)
-            latent_mask= (mask_chunks.sum(dim=-1) == 0)         # True if all pad
+            latent_mask = (torch.abs(x_chunks).sum(dim=-1) < 1e-9) # [B, L_new], True if all pad
         else:
             latent_mask = None
 
+        z = self.to_latent(x_chunks) # Project potentially zero chunks
+
         # --- Latent transformer ------------------------------------------
         for blk in self.blocks:
-            z = blk(z, latent_mask)
+            z = blk(z, latent_mask) # Pass the correctly derived mask
 
         # --- Project back & inverse reshape ------------------------------
         chunks_back = self.from_latent(z)                        # [B,L_new,C_new]

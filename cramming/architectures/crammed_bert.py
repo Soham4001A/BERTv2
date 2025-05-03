@@ -124,14 +124,16 @@ class TransformerLayer(torch.nn.Module):
             self.ffn = torch.nn.Identity()
 
     def forward(self, states, attention_mask: Optional[torch.Tensor] = None):
-        # --- Post‑norm (BERT‑style) sequence ---
-        # 1) Self‑attention → Dropout → Add → LayerNorm
-        attn_out = self.attn(states, attention_mask)                 # sub‑layer
-        states   = self.norm1(states + self.dropout(attn_out))       # post‑norm
+        # --- Revert to Pre-LN sequence ---
+        # Pass normed states into attention
+        attn_output = self.attn(self.norm1(states), attention_mask)
+        # Add residual connection
+        states = states + self.dropout(attn_output)
 
-        # 2) Feed‑forward  → Dropout → Add → LayerNorm
-        ffn_out  = self.ffn(states)                                  # sub‑layer
-        states   = self.norm2(states + self.dropout(ffn_out))        # post‑norm
+        # Pass normed states into FFN
+        ffn_output = self.ffn(self.norm2(states))
+        # Add residual connection
+        states = states + self.dropout(ffn_output)
 
         return states
 
