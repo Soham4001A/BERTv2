@@ -1,6 +1,10 @@
 """Attention modules. The final model uses "self-attention", but other options were tried and are still documented here."""
 import torch
 from transformers.models.bert.modeling_bert import BertSelfAttention
+from .embeddings import Rotary, RotarySanityCheck, RotaryEleutherAI, RotaryLLAMA
+from typing import Optional
+from einops.layers.torch import Rearrange
+from einops import rearrange
 
 # ────────────────────────────────────────────────────────────────────────────
 # Latent Meta Attention – NLP variant
@@ -202,11 +206,6 @@ class LMABertAttention(torch.nn.Module):
         x_unstacked = x_stacked_b.view(B, self.seq_len, self.nh_stack, dk)
         out         = torch.cat(torch.unbind(x_unstacked, dim=2), dim=2)  # [B,S,H]
         return out
-
-from .embeddings import Rotary, RotarySanityCheck, RotaryEleutherAI, RotaryLLAMA
-from typing import Optional
-from einops.layers.torch import Rearrange
-from einops import rearrange
 
 
 def get_attention_mechanism(
