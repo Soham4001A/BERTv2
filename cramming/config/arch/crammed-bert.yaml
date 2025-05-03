@@ -35,7 +35,7 @@ embedding:
 attention:
   # ───────────── core switch ─────────────
   #type: lma                # ← enable Latent Meta Attention
-  type: self_attention      # ← enable standard self-attention
+  type: self-attention      # ← enable standard self-attention
   num_heads: 12           # number of attention heads
   causal_attention: False  # LMA is encoder‑style (leave this False)
   use_outer_ffn: False
