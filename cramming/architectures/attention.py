@@ -134,11 +134,19 @@ class LMABertAttention(torch.nn.Module):
         self.bias               = cfg_attention.qkv_bias
 
         if hidden_size % self.nh_stack != 0:
-            raise ValueError(f"hidden_size {hidden_size} not divisible by num_heads_stacking {self.nh_stack}")
+            raise ValueError(...)
+
+        # ── Static build to enable torch.compile ──────────────────────
+        # If the YAML sets attention.static_seq_len, pre‑build once so
+        # torch.compile never sees Parameter creation in forward().
+        static_seq_len = getattr(cfg_attention, "static_seq_len", None)
+        if static_seq_len is not None:
+            self._build(static_seq_len, torch.device("cpu"))
+            # note: later .to(device) will move these params to GPU
 
         # modules built lazily because they depend on seq_len / C_new
-        self._built          = False
-        self.output_dim      = hidden_size  # required by AttentionComponent
+        self._built     = False
+        self.output_dim = hidden_size
 
     # ---------------------------------------------------------------------
     def _build(self, seq_len: int, device: torch.device):
