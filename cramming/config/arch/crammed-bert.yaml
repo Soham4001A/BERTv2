@@ -69,8 +69,8 @@ init:
 
 # Experimental options:
 ffn_layer_frequency: 1 # FFN layer in every layer
-skip_head_transform: False # This is only possible if embedding_dim=hidden_size
-use_bias: True # Whether to learn biases on all dense layers
+skip_head_transform: True # This is only possible if embedding_dim=hidden_size
+use_bias: False # Whether to learn biases on all dense layers
 final_norm: True # Add a final norm layer before the end
 
 # Downstream settings:
