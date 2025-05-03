@@ -40,7 +40,7 @@ attention:
   # type: lma                # ← enable Latent Meta Attention
   # num_heads: 12           # number of attention heads
   causal_attention: False  # LMA is encoder‑style (leave this False)
-  use_outer_ffn: False
+  use_outer_ffn: True
 
   # ─── head stacking before the latent step ───
   num_heads_stacking: 12    # how many standard heads to “stack” into one block
