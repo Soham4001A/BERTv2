@@ -448,7 +448,7 @@ def _initialize_wandb(setup, cfg):
 
         config_dict = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
         settings = wandb.Settings(start_method="thread")
-        settings.update({"git_root": cfg.original_cwd})
+        settings.git_root = cfg.original_cwd
         run = wandb.init(
             entity=cfg.wandb.entity,
             project=cfg.wandb.project,
