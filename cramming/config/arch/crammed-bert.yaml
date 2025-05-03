@@ -5,7 +5,7 @@
 architectures:
   - ScriptableCrammedBERT
 
-num_transformer_layers: 16
+num_transformer_layers: 16 # --> This is really rather the number of transformer blocks
 hidden_size: 768
 intermed_size: 3072
 hidden_dropout_prob: 0.1
@@ -49,9 +49,9 @@ attention:
   # ───────────── latent‑space hyper‑params ─────────────
   d_new: 384               # size of each latent token (≈ hidden_size / 2)
   target_l_new: 64         # desired latent sequence length (≈ S / 2)
-  static_seq_len: 128        # pre‑build LMA once for this sequence length
+  static_seq_len: 128      # pre‑build LMA once for this sequence length
   num_heads_latent: 8      # heads inside each latent block
-  num_blocks: 12        # how many latent transformer blocks to run
+  num_blocks: 1            # how many latent transformer blocks per layer (we need better convetion for this)
   ff_latent_hidden: 1536   # inner size of the latent MLP (≈ 4 × d_new)
 
   # ───────────── misc options ─────────────
