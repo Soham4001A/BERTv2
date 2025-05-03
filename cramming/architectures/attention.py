@@ -128,7 +128,7 @@ class LMABertAttention(torch.nn.Module):
         self.d_new              = int(getattr(cfg_attention, "d_new", hidden_size // 2))
         self.nh_latent          = int(getattr(cfg_attention, "num_heads_latent", 4))
         self.ff_latent_hidden   = int(getattr(cfg_attention, "ff_latent_hidden", 4 * self.d_new))
-        self.n_layers           = int(getattr(cfg_attention, "num_lma_layers", 2))
+        self.n_blocks           = int(getattr(cfg_attention, "num_blocks", 2))
         self.target_l_new_cfg   = getattr(cfg_attention, "target_l_new", None)
         self.dropout            = cfg_attention.dropout_prob
         self.bias               = cfg_attention.qkv_bias
@@ -162,7 +162,7 @@ class LMABertAttention(torch.nn.Module):
         self.blocks = torch.nn.ModuleList([
             _LMABlock(self.d_new, self.nh_latent, self.ff_latent_hidden,
                       self.dropout, self.bias)
-            for _ in range(self.n_layers)
+            for _ in range(self.n_blocks)
         ])
         # move latent blocks to the correct device
         self.blocks = self.blocks.to(device)
