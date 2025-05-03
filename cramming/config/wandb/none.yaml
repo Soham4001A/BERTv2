@@ -1,4 +1,4 @@
-enabled: False
-entity:
-project:
+enabled: True
+entity: soham4001a
+project: cramming-pretrain
 tags: []
