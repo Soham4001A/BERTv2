@@ -25,7 +25,7 @@ from .components import (
 )
 # Import the specific LMA class if needed for type checking or direct use (optional)
 from .attention import get_attention_mechanism, LMABertAttention
-
+from .latent import InitialLatentTransform, LatentLayer
 
 class crammedBertConfig(PretrainedConfig):
     model_type = "crammedBERT"
@@ -171,7 +171,22 @@ class ScriptableLM(PreTrainedModel):
         self.cfg = OmegaConf.create(config.arch)
 
         self.embedding = EmbeddingComponent(self.cfg.embedding, self.cfg.norm, self.cfg.norm_eps)
-        self.layers = torch.nn.ModuleList([TransformerLayer(idx, self.cfg) for idx in range(self.cfg.num_transformer_layers)])
+
+        # --- NEW latent front‑end ---
+        self.latent_front = InitialLatentTransform(self.cfg.hidden_size, self.cfg.attention)
+
+        # Build latent Transformer stack
+        self.layers = torch.nn.ModuleList([
+            LatentLayer(
+                d_new=self.cfg.attention.d_new,
+                nh_latent=self.cfg.attention.num_heads_latent,
+                ff_hidden=self.cfg.attention.ff_latent_hidden,
+                dropout=self.cfg.hidden_dropout_prob,
+                bias=self.cfg.use_bias,
+            )
+            for _ in range(self.cfg.num_transformer_layers)
+        ])      
+        
         self.seq_first = self.layers[0].LAYOUT == "[S B H]" if len(self.layers) > 0 else False
         self.use_causal_attention = self.cfg.attention.causal_attention
 
@@ -180,34 +195,20 @@ class ScriptableLM(PreTrainedModel):
         else:
             self.final_norm = torch.nn.Identity()
 
-    def forward(self, input_ids, attention_mask: Optional[torch.Tensor] = None, labels: Optional[torch.Tensor] = None):
-        if attention_mask is not None:
-            # Ensure mask is processed correctly based on layout BEFORE passing to first layer
-            if not self.seq_first and attention_mask.dim() == 2:
-                 # Standard MHA expects [B, S] -> [B, 1, 1, S] or similar broadcastable
-                 attention_mask = get_extended_attention_mask(attention_mask, input_ids.shape, self.use_causal_attention)
-            # If seq_first, the attention mechanism inside handles the layout adjustment if needed
-            # LMA handles its own mask conversion internally
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        x = self.embedding(input_ids)                      # [B,S,H]
 
-        hidden_states = self.embedding(input_ids)
+        if attention_mask is not None:                    # [B,S] → float 0/1
+            if attention_mask.dim()==2:  attention_mask = attention_mask.float()
+            if attention_mask.dim()==4:  attention_mask = (attention_mask>-0.5).float().squeeze(1).squeeze(1)
 
-        if self.seq_first:
-            hidden_states = hidden_states.transpose(0, 1).contiguous()
-            # Potentially adjust mask layout if needed for seq_first standard attention
-            # LMA handles [B, S, H] input regardless of internal layout
+        z, latent_mask = self.latent_front(x, attention_mask)    # -> latent space
 
-        # --- Layer Loop ---
-        for i, layer_module in enumerate(self.layers):
-             # Pass the appropriate mask format
-             current_mask = attention_mask # Pass the potentially extended mask
-             # LMA internal forward handles mask conversion from various formats
-             hidden_states = layer_module(hidden_states, current_mask)
+        for blk in self.layers:
+            z = blk(z, latent_mask)
 
-
-        if self.seq_first:
-            hidden_states = hidden_states.transpose(0, 1).contiguous()
-
-        return self.final_norm(hidden_states)
+        z = self.final_norm(z)                              # still on d_new
+        return z                                            # [B,L_new,d_new]
 
 
 class ScriptableLMForPreTraining(PreTrainedModel):
@@ -219,6 +220,13 @@ class ScriptableLMForPreTraining(PreTrainedModel):
         self.cfg = OmegaConf.create(config.arch)
 
         self.encoder = ScriptableLM(config)
+
+        # project latent d_new -> original hidden/embedding dim (H)
+        self.latent_to_hidden = torch.nn.Linear(
+            self.cfg.attention.d_new,
+            self.cfg.embedding.embedding_dim,
+            bias=self.cfg.use_bias,
+        )
 
         if not self.cfg.skip_head_transform:
             self.prediction_head = PredictionHeadComponent(self.cfg)
@@ -251,28 +259,20 @@ class ScriptableLMForPreTraining(PreTrainedModel):
 
 
     def forward(self, input_ids, attention_mask: Optional[torch.Tensor] = None, labels: Optional[torch.Tensor] = None, **kwargs):
-        outputs = self.encoder(input_ids, attention_mask)
-        # Ensure outputs is viewed correctly before prediction head/decoder
-        # Shape should be [B*S, H] if not sparse? Or [B, S, H]? Check components.
-        # Assuming prediction_head/decoder expect [..., H]
-        outputs_for_head = outputs.view(-1, outputs.shape[-1])
+        # latent outputs  [B , L_new , d_new]
+        z_latent = self.encoder(input_ids, attention_mask)
 
+        # flatten sequence then project to original hidden size
+        z_flat   = z_latent.view(-1, z_latent.size(-1))                # [B*L_new , d_new]
+        h_flat   = self.latent_to_hidden(z_flat)                       # [B*L_new , H]
 
-        if self.sparse_prediction and labels is not None:
-            masked_lm_loss = self._forward_sparse(outputs_for_head, labels)
-            # Need logits for potential metrics - recompute on full sequence?
-            # Or just return loss? For now, return loss.
-            logits = None # Or compute non-sparse for logging?
-        else:
-            processed_outputs = self.prediction_head(outputs_for_head)
-            logits = self.decoder(processed_outputs)
-            masked_lm_loss = logits.new_zeros((1,)) # Ensure loss tensor is on correct device
-            if labels is not None:
-                masked_lm_loss = self.loss_fn(logits, labels.view(-1))
+        logits   = self.decoder(self.prediction_head(h_flat))          # [B*L_new , vocab]
 
+        loss = logits.new_zeros((1,))
+        if labels is not None:
+            loss = self.loss_fn(logits, labels.view(-1))
 
-        # Return loss and maybe logits (handle sparse case where logits might be partial)
-        return {"loss": masked_lm_loss, "logits": logits if not (self.sparse_prediction and labels is not None) else None}
+        return {"loss": loss, "logits": logits.view(*z_latent.shape[:2], -1)}
 
 
     # Sparse prediction logic seems okay based on comments
@@ -301,6 +301,12 @@ class ScriptableLMForSequenceClassification(PreTrainedModel):
         self.num_labels = self.cfg.num_labels
 
         self.encoder = ScriptableLM(config)
+        # projector latent -> hidden
+        self.latent_to_hidden = torch.nn.Linear(
+            self.cfg.attention.d_new,
+            self.cfg.hidden_size,
+            bias=self.cfg.use_bias,
+        )
         self.pooler = PoolingComponent(self.cfg.classification_head, self.cfg.hidden_size)
         self.head = torch.nn.Linear(self.cfg.classification_head.head_dim, self.num_labels)
 
@@ -319,7 +325,9 @@ class ScriptableLMForSequenceClassification(PreTrainedModel):
             )
 
     def forward(self, input_ids, attention_mask: Optional[torch.Tensor] = None, labels: Optional[torch.Tensor] = None, **kwargs):
-        logits = self.head(self.pooler(self.encoder(input_ids, attention_mask)))
+        latent = self.encoder(input_ids, attention_mask)               # [B,L_new,d_new]
+        hidden = self.latent_to_hidden(latent)                         # [B,L_new,H]
+        logits = self.head(self.pooler(hidden))
 
         if labels is not None:
             if self.problem_type is None:  # very much from huggingface
@@ -454,6 +462,11 @@ class ScriptableLMForTokenClassification(PreTrainedModel):
         self.cfg = OmegaConf.create(config.arch)
 
         self.encoder = ScriptableLM(config)
+        self.latent_to_hidden = torch.nn.Linear(
+            self.cfg.attention.d_new,
+            self.cfg.hidden_size,
+            bias=self.cfg.use_bias,
+        )
         self.head = torch.nn.Linear(self.cfg.classification_head.head_dim, self.num_labels)
 
         self.problem_type = None
@@ -471,7 +484,7 @@ class ScriptableLMForTokenClassification(PreTrainedModel):
             )
 
     def forward(self, input_ids, attention_mask: Optional[torch.Tensor] = None, labels: Optional[torch.Tensor] = None):
-        logits = self.head(self.encoder(input_ids, attention_mask))
+        logits = self.head(self.latent_to_hidden(self.encoder(input_ids, attention_mask)))
 
         if labels is not None:
             if self.problem_type is None:  # very much from huggingface
