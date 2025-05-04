@@ -19,6 +19,23 @@ class InitialLatentTransform(torch.nn.Module):
         self._built = False
         self.target_L = getattr(cfg_attn, "target_l_new", None)
 
+        # ------------------------------------------------------------------
+        #  Static build: required when torch.compile(fullgraph=True) because
+        #  parameter creation is **not** allowed inside the forward pass.
+        #  We therefore build the Linear projection once here, using the
+        #  sequence length configured in the attention config.
+        # ------------------------------------------------------------------
+        static_S = getattr(cfg_attn, "static_seq_len", None)
+        if static_S is None:
+            raise ValueError(
+                "InitialLatentTransform requires `cfg_attn.static_seq_len` "
+                "when torch.compile(fullgraph=True); please set it in the "
+                "YAML (e.g. 128 for BERT‑base)."
+            )
+        # Build parameters on CPU – they will be moved to the correct device
+        # by the first `.to(device)` call in the main model.
+        self._build(static_S, torch.device("cpu"))
+
     def _build(self, S:int, device):
         total = S * self.hidden_size
         L_new = _find_closest_divisor(total, self.target_L or max(2, S//2))
@@ -32,8 +49,12 @@ class InitialLatentTransform(torch.nn.Module):
 
     def forward(self, x:torch.Tensor, mask:Optional[torch.Tensor]=None):
         B,S,H = x.shape
-        if not self._built:              self._build(S, x.device)
-        elif S != self.seq_len:          raise RuntimeError("varying seq len not supported (build once)")
+        if S != self.seq_len:
+            raise RuntimeError(
+                f"InitialLatentTransform was built for seq_len={self.seq_len}, "
+                f"but received seq_len={S}.  Either pad/trim sequences to a "
+                f"fixed length or rebuild the model with the desired length."
+            )
 
         if mask is not None:             x = x * mask.unsqueeze(-1)  # zero PAD
 
