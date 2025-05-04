@@ -61,29 +61,20 @@ class _LatentAttention(torch.nn.Module):
         q = q.view(B, L, self.nh, self.dk).transpose(1, 2)          # [B,nh,L,dk]
         k = k.view(B, L, self.nh, self.dk).transpose(1, 2)
         v = v.view(B, L, self.nh, self.dk).transpose(1, 2)
-        # Use Flash‑SDPA only when no key‑padding mask is needed; otherwise fall back
-        if self.flash: # Use SDPA if available
-            # SDPA key_padding_mask expects [B, L_key_seq] boolean where True means MASK
-            # Your latent_mask is [B, L], boolean, True means MASK. Perfect match.
+        # ----- Attention computation -----------------------------------------
+        # Flash‑SDPA (PyTorch ≥2.0) does **not** accept key_padding_mask until 2.7.
+        # Therefore we call it only if *no* padding mask is needed.
+        if self.flash and mask is None:
             y = torch.nn.functional.scaled_dot_product_attention(
                     q, k, v,
-                    attn_mask=None, # Not needed for standard padding
                     dropout_p=self.at_drop.p if self.training else 0.0,
-                    is_causal=False,
-                    # Use the key_padding_mask argument when mask is provided
-                    # Needs boolean mask where True indicates padding/masking
-                    key_padding_mask=mask if mask is not None else None # Pass mask directly
-                    )
-        else: # Manual path only if flash/SDPA is not available
+                    is_causal=False)
+        else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / self.dk ** 0.5)
-            if mask is not None:                    # mask shape [B, L] (boolean, True=MASK)
-                # Mask attention *to* padded keys (columns)
-                att = att.masked_fill(mask[:, None, None, :], float("-inf"))
-                # OPTIONAL BUT RECOMMENDED: Mask attention *from* padded queries (rows)
-                # This prevents padded queries from contributing weirdness, even if small
-                att = att.masked_fill(mask[:, None, :, None], float("-inf")) # Add this line
+            if mask is not None:                       # mask shape [B,L] boolean; True = pad
+                att = att.masked_fill(mask[:, None, None, :], float("-inf"))  # mask TO padded keys
+                att = att.masked_fill(mask[:, None, :, None], float("-inf"))  # mask FROM padded queries
             att = torch.nn.functional.softmax(att, dim=-1)
-            # Apply dropout *after* softmax
             att = self.at_drop(att)
             y   = att @ v
 
@@ -226,8 +217,10 @@ class LMABertAttention(torch.nn.Module):
         head_views  = torch.split(hidden_states, dk, dim=2)      # list len=nh_stack
         # propagate padding mask through the same reshape pipeline
         if mask is not None:
-            mask_views = torch.split(mask, dk, dim=2)           # list len=nh_stack
-            m_stacked   = torch.cat(mask_views, dim=1)          # [B,S*nh,1]
+            # repeat the per‑token mask for every stacked head
+            m_stacked = mask.repeat(1, self.nh_stack, 1)        # [B, S*nh_stack, 1]
+        else:
+            m_stacked = None
         x_stacked   = torch.cat(head_views, dim=1)               # [B,S*nh_stack,dk]
         x_stacked   = x_stacked * (1.0 / self.nh_stack**0.5)  # ← keep variance ~constant
 
@@ -238,11 +231,14 @@ class LMABertAttention(torch.nn.Module):
 
         # propagate mask through rechunk
         if mask is not None:
-            latent_mask = (torch.abs(x_chunks).sum(dim=-1) < 1e-9) # [B, L_new], True if all pad
+            # Build a boolean latent‑level mask: True = entire latent token is padding
+            # 1) expand per‑token mask over hidden dim, flatten, then view into chunks
+            tok_mask_bool      = mask.squeeze(-1).bool()              # [B,S]
+            mask_flat          = tok_mask_bool.unsqueeze(-1).expand(-1, -1, H).reshape(B, -1)  # [B,S*H]
+            mask_chunks        = mask_flat.view(B, self.L_new, self.C_new)                     # [B,L_new,C_new]
+            latent_mask        = mask_chunks.all(dim=-1)                                       # [B,L_new]  (bool)
         else:
             latent_mask = None
-
-        z = self.to_latent(x_chunks) # Project potentially zero chunks
 
         # --- Latent transformer ------------------------------------------
         for blk in self.blocks:
