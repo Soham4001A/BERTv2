@@ -4,7 +4,7 @@
 name: bert-o4
 
 defaults:
-  - optim: DAG
+  - optim: adam
   - optim_mod: disabled
 
 optim:
