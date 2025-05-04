@@ -247,7 +247,7 @@ class LMABertAttention(torch.nn.Module):
         # --- 3. LMA Stage 2a: Head Stacking ---
         head_views = torch.split(hidden_states, self.dk_stack, dim=2)
         x_stacked  = torch.cat(head_views, dim=1) # [B, S*nh_stack, dk_stack]
-        x_stacked  = x_stacked * (1.0 / math.sqrt(self.nh_stack)) # Keep variance ~constant
+        # x_stacked  = x_stacked * (1.0 / math.sqrt(self.nh_stack)) # Keep variance ~constant
 
         # --- 4. LMA Stage 2b: Re-Chunking & Project to Latent (Z) ---
         flat_stacked = x_stacked.view(B, -1)             # [B, S*H]
