@@ -89,7 +89,7 @@ class _LatentAttentionInternal(torch.nn.Module):
                     dropout_p=self.at_drop.p if self.training else 0.0,
                     is_causal=False,
                     # Use key_padding_mask
-                    key_padding_mask=attn_mask_bool
+                    #key_padding_mask=attn_mask_bool
                     )
         else: # Manual path
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.dk))
