@@ -52,6 +52,8 @@ class InitialLatentTransform(torch.nn.Module):
 
 class LatentLayer(torch.nn.Module):
     """A *single* Transformer block that works *entirely* in latent space."""
+    __constants__ = ["LAYOUT"]
+    LAYOUT: str = "[B S H]"
     def __init__(self, d_new:int, nh_latent:int, ff_hidden:int, dropout:float, bias:bool):
         super().__init__()
         self.ln1   = _LayerNorm(d_new, bias)
