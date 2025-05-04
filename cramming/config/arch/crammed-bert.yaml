@@ -1,6 +1,11 @@
 # Instantiates a (non-huggingface) scriptable encoder-based LM with BERT as baseline
 # Modernized version of bert-c5
 
+# Useful commands for compile cache removel during studies-
+# find . -name "__pycache__" -type d -exec rm -rf {} +
+# find . -name "*.pyc" -delete
+# rm -rf ~/.cache/torch/compile
+
 # These are the huggingface bert parameters
 architectures:
   - ScriptableCrammedBERT
@@ -40,8 +45,8 @@ attention:
   use_outer_ffn: True # whether to use the outer FFN in the attention block (only for MHA)
   # ───────────── LMA switch ─────────────
 
-  # type: lma                # ← enable Latent Meta Attention
-  # num_heads: 12           # number of attention heads
+  type: lma                # ← enable Latent Meta Attention
+  num_heads: 12           # number of attention heads
   causal_attention: False  # LMA is encoder‑style (leave this False)
 
 
