@@ -24,7 +24,7 @@ from .components import (
     _init_module,
 )
 # Import the specific LMA class if needed for type checking or direct use (optional)
-from .attention import get_attention_mechanism, LMABertAttention
+from .attention import get_attention_mechanism
 from .latent import InitialLatentTransform, LatentLayer
 
 class crammedBertConfig(PretrainedConfig):
@@ -269,23 +269,30 @@ class ScriptableLMForPreTraining(PreTrainedModel):
 
         logits = self.decoder(self.prediction_head(h_tokens))  # [B,S,vocab]
 
-        loss = logits.new_zeros((1,))
+        # -------- Loss ---------
         if labels is not None:
-            loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+            if self.sparse_prediction:
+                loss = self._forward_sparse(h_tokens, labels)
+            else:
+                loss = self.loss_fn(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1)
+                )
+        else:
+            loss = logits.new_zeros((1,))
 
         return {"loss": loss, "logits": logits}
 
 
-    # Sparse prediction logic seems okay based on comments
-    def _forward_sparse(self, outputs: torch.Tensor, labels: Optional[torch.Tensor] = None):
-        # ...(Same as your provided code)...
+    def _forward_sparse(self, hidden_states: torch.Tensor, labels: Optional[torch.Tensor] = None):
         labels = labels.view(-1)
-        mask_positions = labels.view(-1) != self.loss_fn.ignore_index
-        num_masks_guaranteed = round(self.sparse_prediction * labels.shape[0])
+        mask_positions = labels != self.loss_fn.ignore_index
+        num_masks_guaranteed = round(self.sparse_prediction * labels.numel())
         indices = torch.argsort(mask_positions.int())[-num_masks_guaranteed:]
-        outputs = outputs[indices]
+
+        hidden_states = hidden_states.view(-1, hidden_states.size(-1))[indices]  # sparse hidden
         labels = labels[indices]
-        processed_outputs = self.prediction_head(outputs) # Apply head to sparse outputs
+        processed_outputs = self.prediction_head(hidden_states) # Apply head to sparse outputs
         logits = self.decoder(processed_outputs)
         masked_lm_loss = self.loss_fn(logits, labels)
         return masked_lm_loss

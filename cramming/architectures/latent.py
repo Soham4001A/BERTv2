@@ -69,7 +69,23 @@ class InitialLatentTransform(torch.nn.Module):
         # derive boolean latent_pad_mask
         latent_pad = None
         if mask is not None:
-            latent_pad = (z.abs().sum(-1) < 1e-9)   # True = PAD
+            # ------------------------------------------------------------------
+            # Derive robust latent‑space padding mask.
+            #  • mask : [B,S,1]  (1 = real token, 0 = PAD)
+            #  • A latent position is PAD only if *all* contributing S·H elements
+            #    were PAD.  We therefore expand the token‑mask over the hidden
+            #    dimension, follow the same flatten‑and‑chunk pattern as the
+            #    data path, and then mark PAD when the chunk sum is zero.
+            # ------------------------------------------------------------------
+            B = mask.size(0)
+            tok_mask = mask.squeeze(-1)                     # [B,S]   1/0
+            mask_expanded_flat = tok_mask.unsqueeze(-1) \
+                                        .repeat(1, 1, self.hidden_size) \
+                                        .view(B, -1)        # [B,S*H]
+            mask_chunks = mask_expanded_flat.view(B, self.L_new, self.C_new)
+            latent_pad = (mask_chunks.sum(dim=-1) == 0)     # [B,L_new]  bool
+            # Zero‑out latent vectors that originate solely from padding
+            z = z.masked_fill(latent_pad.unsqueeze(-1), 0.0)
 
         return z, latent_pad
 
