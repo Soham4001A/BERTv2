@@ -223,6 +223,7 @@ class ScriptableLMForPreTraining(PreTrainedModel):
         self.encoder = ScriptableLM(config)
 
         # project latent d_new -> original hidden/embedding dim (H)
+        # (No longer used; kept for compatibility)
         self.latent_to_hidden = torch.nn.Linear(
             self.cfg.attention.d_new,
             self.cfg.embedding.embedding_dim,
@@ -263,17 +264,16 @@ class ScriptableLMForPreTraining(PreTrainedModel):
         # latent outputs  [B , L_new , d_new]
         z_latent = self.encoder(input_ids, attention_mask)
 
-        # flatten sequence then project to original hidden size
-        z_flat   = z_latent.view(-1, z_latent.size(-1))                # [B*L_new , d_new]
-        h_flat   = self.latent_to_hidden(z_flat)                       # [B*L_new , H]
+        # Convert back to token‑level hidden states [B,S,H]
+        h_tokens = self.encoder.latent_front.inverse_transform(z_latent)
 
-        logits   = self.decoder(self.prediction_head(h_flat))          # [B*L_new , vocab]
+        logits = self.decoder(self.prediction_head(h_tokens))  # [B,S,vocab]
 
         loss = logits.new_zeros((1,))
         if labels is not None:
-            loss = self.loss_fn(logits, labels.view(-1))
+            loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
 
-        return {"loss": loss, "logits": logits.view(*z_latent.shape[:2], -1)}
+        return {"loss": loss, "logits": logits}
 
 
     # Sparse prediction logic seems okay based on comments

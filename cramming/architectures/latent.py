@@ -44,6 +44,8 @@ class InitialLatentTransform(torch.nn.Module):
         self.C_new  = total // L_new
 
         self.to_latent = torch.nn.Linear(self.C_new, self.d_new, bias=self.bias).to(device)
+        # linear to return from latent space
+        self.from_latent = torch.nn.Linear(self.d_new, self.C_new, bias=self.bias).to(device)
         self.seq_len   = S
         self._built = True
 
@@ -70,6 +72,22 @@ class InitialLatentTransform(torch.nn.Module):
             latent_pad = (z.abs().sum(-1) < 1e-9)   # True = PAD
 
         return z, latent_pad
+
+    # ------------------------------------------------------------------
+    def inverse_transform(self, z_latent: torch.Tensor) -> torch.Tensor:
+        """
+        Map latent tensor [B, L_new, d_new] back to original hidden space
+        [B, S, H].  No masking logic here – caller can zero PAD tokens.
+        """
+        B, L_new, _ = z_latent.shape
+        # latent -> chunk features
+        chunks_back = self.from_latent(z_latent)              # [B, L_new, C_new]
+        flat_back   = chunks_back.reshape(B, -1)              # [B, S*H]
+        x_stacked   = flat_back.view(B, self.seq_len * self.nh_stack, self.dk)
+        # un‑stack heads
+        x_unstack   = x_stacked.view(B, self.seq_len, self.nh_stack, self.dk)
+        out         = torch.cat(torch.unbind(x_unstack, dim=2), dim=2)  # [B,S,H]
+        return out
 
 class LatentLayer(torch.nn.Module):
     """A *single* Transformer block that works *entirely* in latent space."""
