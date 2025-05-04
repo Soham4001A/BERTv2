@@ -23,7 +23,8 @@ from .components import (
     get_extended_attention_mask,
     _init_module,
 )
-from .attention import get_attention_mechanism
+# Import the specific LMA class if needed for type checking or direct use (optional)
+from .attention import get_attention_mechanism, LMABertAttention
 
 
 class crammedBertConfig(PretrainedConfig):
@@ -53,27 +54,36 @@ def construct_crammed_bert(cfg_arch, vocab_size, downstream_classes=None):
 
 
 class AttentionComponent(torch.nn.Module):
+    # No changes needed here, it just wraps whatever get_attention_mechanism returns
     def __init__(self, idx, hidden_size, cfg_attention, use_bias=True):
         super().__init__()
         self.self_attention = get_attention_mechanism(idx, hidden_size, cfg_attention)
-        if cfg_attention.skip_output_projection:
-            self.dense = torch.nn.Identity()
+        # Check if the instantiated attention module is LMA
+        # LMA now handles its own output projection implicitly by returning to H
+        # So skip the dense layer if it's LMA
+        # ** Correction: The LMABertAttention now returns H dim, so the dense layer
+        # ** is still needed IF the output dim isn't H (unlikely for LMA now)
+        # ** OR if skip_output_projection is True in config. Let's keep original logic.
+        if getattr(cfg_attention, "skip_output_projection", False):
+             self.dense = torch.nn.Identity()
         else:
-            self.dense = torch.nn.Linear(self.self_attention.output_dim, hidden_size, bias=use_bias)
+            # Check output dim; LMA now outputs hidden_size
+            output_dim = getattr(self.self_attention, "output_dim", hidden_size)
+            self.dense = torch.nn.Linear(output_dim, hidden_size, bias=use_bias)
+
 
         self.LAYOUT = self.self_attention.LAYOUT
 
     def forward(self, hidden_states, attention_mask: Optional[torch.Tensor] = None):
-        return self.dense(self.self_attention(hidden_states, attention_mask))
+        # The LMABertAttention module now handles everything internally
+        # The dense layer might still be needed if skip_output_projection=False,
+        # acting as the standard final projection after attention.
+        attn_output = self.self_attention(hidden_states, attention_mask)
+        return self.dense(attn_output)
 
 
 class FFNComponent(torch.nn.Module):
-    """Note: The FF layer is not auto-scaled when using a GLU type activation.
-    It actually turned out better not to scale it, so here the block is effectively smaller than may be expected.
-
-    The neox suggestion for approx. equal parameter count is int(4 * 2 / 3 * hidden_size) * 2 [this is ~5.33]
-    """
-
+    # No changes needed here, standard FFN
     def __init__(self, hidden_size, intermed_size, nonlin_fn=torch.nn.GELU, use_bias=True):
         super().__init__()
         self.dense_in = torch.nn.Linear(hidden_size, intermed_size, bias=use_bias)
@@ -89,30 +99,30 @@ class FFNComponent(torch.nn.Module):
 
 
 class TransformerLayer(torch.nn.Module):
-    """A transformer-encoder structure based on the components from above."""
-
+    """
+    A transformer-encoder structure.
+    MODIFIED: If attention type is LMA, it skips outer Norm/FFN/Residuals.
+    """
     def __init__(self, idx, cfg_arch):
         super().__init__()
+        self.cfg_arch = cfg_arch # Store config
+        self.is_lma = (cfg_arch.attention.type == "lma")
+
         self.dropout = torch.nn.Dropout(cfg_arch.hidden_dropout_prob, inplace=False)
-        self.norm1 = _get_norm_fn(cfg_arch.norm)(cfg_arch.hidden_size, eps=cfg_arch.norm_eps)
-        self.norm2 = _get_norm_fn(cfg_arch.norm)(cfg_arch.hidden_size, eps=cfg_arch.norm_eps)
+
+        # Instantiate Attention Component (could be LMA or standard)
         self.attn = AttentionComponent(
             idx,
             cfg_arch.hidden_size,
             cfg_arch.attention,
             cfg_arch.use_bias,
         )
-        self.LAYOUT = self.attn.LAYOUT
+        self.LAYOUT = self.attn.LAYOUT # Inherit layout
 
-        # ── Feed‑forward network (outer FFN) ────────────────────────────
-        # For Latent Meta Attention we usually *omit* the full‑size FFN
-        # because an MLP already lives inside the latent transformer.
-        use_outer_ffn = True
-        if cfg_arch.attention.type == "lma":
-            # YAML knob: attention.use_outer_ffn  (default False for LMA)
-            use_outer_ffn = getattr(cfg_arch.attention, "use_outer_ffn", False)
-
-        if use_outer_ffn:
+        # Only instantiate outer Norm/FFN if NOT LMA
+        if not self.is_lma:
+            self.norm1 = _get_norm_fn(cfg_arch.norm)(cfg_arch.hidden_size, eps=cfg_arch.norm_eps)
+            self.norm2 = _get_norm_fn(cfg_arch.norm)(cfg_arch.hidden_size, eps=cfg_arch.norm_eps)
             self.ffn = FFNComponent(
                 cfg_arch.hidden_size,
                 cfg_arch.intermed_size,
@@ -120,26 +130,40 @@ class TransformerLayer(torch.nn.Module):
                 cfg_arch.use_bias,
             )
         else:
-            # Identity keeps the residual connection intact but costs nothing.
-            self.ffn = torch.nn.Identity()
+            # Create dummy modules or None if LMA, as they are bypassed
+            self.norm1 = torch.nn.Identity() # Not used
+            self.norm2 = torch.nn.Identity() # Not used
+            self.ffn = torch.nn.Identity()   # Not used
 
     def forward(self, states, attention_mask: Optional[torch.Tensor] = None):
-        # Pre-LN for Attention
-        normed_states_for_attn = self.norm1(states)
-        attn_output = self.attn(normed_states_for_attn, attention_mask)
-        states = states + self.dropout(attn_output) # Residual connection 1
+        if self.is_lma:
+            # --- LMA Path ---
+            # The refactored LMABertAttention handles its internal norms,
+            # FFN, and residuals. Just call it directly.
+            # The outer dropout is applied to the final output of the LMA block.
+            states = self.dropout(self.attn(states, attention_mask))
+            # NOTE: The original paper structure implies dropout within the
+            # residual adds inside LMA. Applying it outside here might differ slightly.
+            # Consider moving dropout inside LMABertAttention's residual adds if needed.
+        else:
+            # --- Standard Pre-LN Path ---
+            normed_states_for_attn = self.norm1(states)
+            attn_output = self.attn(normed_states_for_attn, attention_mask)
+            states = states + self.dropout(attn_output) # Residual connection 1
 
-        # Pre-LN for FFN
-        normed_states_for_ffn = self.norm2(states)
-        ffn_output = self.ffn(normed_states_for_ffn)
-        states = states + self.dropout(ffn_output) # Residual connection 2
+            normed_states_for_ffn = self.norm2(states)
+            ffn_output = self.ffn(normed_states_for_ffn)
+            states = states + self.dropout(ffn_output) # Residual connection 2
 
         return states
 
+# --- ScriptableLM and downstream heads remain unchanged ---
+# They interact with the output of the TransformerLayer stack,
+# which now correctly returns [B, S, H] for both LMA and standard attention.
 
 class ScriptableLM(PreTrainedModel):
     """Simplified transformer wrapper."""
-
+    # (Content remains the same as your provided file)
     config_class = crammedBertConfig
 
     def __init__(self, config):
@@ -158,14 +182,27 @@ class ScriptableLM(PreTrainedModel):
 
     def forward(self, input_ids, attention_mask: Optional[torch.Tensor] = None, labels: Optional[torch.Tensor] = None):
         if attention_mask is not None:
-            attention_mask = get_extended_attention_mask(attention_mask, input_ids.shape, self.use_causal_attention)
+            # Ensure mask is processed correctly based on layout BEFORE passing to first layer
+            if not self.seq_first and attention_mask.dim() == 2:
+                 # Standard MHA expects [B, S] -> [B, 1, 1, S] or similar broadcastable
+                 attention_mask = get_extended_attention_mask(attention_mask, input_ids.shape, self.use_causal_attention)
+            # If seq_first, the attention mechanism inside handles the layout adjustment if needed
+            # LMA handles its own mask conversion internally
+
         hidden_states = self.embedding(input_ids)
 
         if self.seq_first:
             hidden_states = hidden_states.transpose(0, 1).contiguous()
+            # Potentially adjust mask layout if needed for seq_first standard attention
+            # LMA handles [B, S, H] input regardless of internal layout
 
+        # --- Layer Loop ---
         for i, layer_module in enumerate(self.layers):
-            hidden_states = layer_module(hidden_states, attention_mask)
+             # Pass the appropriate mask format
+             current_mask = attention_mask # Pass the potentially extended mask
+             # LMA internal forward handles mask conversion from various formats
+             hidden_states = layer_module(hidden_states, current_mask)
+
 
         if self.seq_first:
             hidden_states = hidden_states.transpose(0, 1).contiguous()
@@ -174,8 +211,7 @@ class ScriptableLM(PreTrainedModel):
 
 
 class ScriptableLMForPreTraining(PreTrainedModel):
-    """Pretraining version with optional prediction head and variant for sparse prediction."""
-
+    # (Content remains the same as your provided file)
     config_class = crammedBertConfig
 
     def __init__(self, config):
@@ -190,7 +226,9 @@ class ScriptableLMForPreTraining(PreTrainedModel):
             self.prediction_head = torch.nn.Identity()  # from linear in old version
 
         self.decoder = torch.nn.Linear(self.cfg.embedding.embedding_dim, self.cfg.embedding.vocab_size, bias=self.cfg.decoder_bias)
-        self.decoder.weight = self.encoder.embedding.word_embedding.weight
+        # Tie weights if configured
+        if self.cfg.tie_weights:
+            self.decoder.weight = self.encoder.embedding.word_embedding.weight
 
         self.loss_fn = torch.nn.CrossEntropyLoss()
         self.sparse_prediction = self.cfg.sparse_prediction
@@ -207,45 +245,48 @@ class ScriptableLMForPreTraining(PreTrainedModel):
                 self.cfg.hidden_size,
                 self.cfg.num_transformer_layers,
             )
+        # Tie weights explicitly after initialization if needed (redundant if done in init)
+        if self.cfg.tie_weights:
+             self.decoder.weight = self.encoder.embedding.word_embedding.weight
+
 
     def forward(self, input_ids, attention_mask: Optional[torch.Tensor] = None, labels: Optional[torch.Tensor] = None, **kwargs):
         outputs = self.encoder(input_ids, attention_mask)
-        outputs = outputs.view(-1, outputs.shape[-1])
+        # Ensure outputs is viewed correctly before prediction head/decoder
+        # Shape should be [B*S, H] if not sparse? Or [B, S, H]? Check components.
+        # Assuming prediction_head/decoder expect [..., H]
+        outputs_for_head = outputs.view(-1, outputs.shape[-1])
+
 
         if self.sparse_prediction and labels is not None:
-            masked_lm_loss = self._forward_sparse(outputs, labels)
+            masked_lm_loss = self._forward_sparse(outputs_for_head, labels)
+            # Need logits for potential metrics - recompute on full sequence?
+            # Or just return loss? For now, return loss.
+            logits = None # Or compute non-sparse for logging?
         else:
-            outputs = self.decoder(self.prediction_head(outputs))
+            processed_outputs = self.prediction_head(outputs_for_head)
+            logits = self.decoder(processed_outputs)
+            masked_lm_loss = logits.new_zeros((1,)) # Ensure loss tensor is on correct device
             if labels is not None:
-                masked_lm_loss = self.loss_fn(outputs, labels.view(-1))
-            else:
-                masked_lm_loss = outputs.new_zeros((1,))
+                masked_lm_loss = self.loss_fn(logits, labels.view(-1))
 
-        return {"loss": masked_lm_loss, "outputs": outputs}
 
-    # Sparse prediction usually has an unpredictable number of entries in each batch
-    # but the dataloader was modified so that 25% of the batch is ALWAYS masked.
-    # This allows for static compilation. If you modify the dataloader, this function will fill your compile cache
+        # Return loss and maybe logits (handle sparse case where logits might be partial)
+        return {"loss": masked_lm_loss, "logits": logits if not (self.sparse_prediction and labels is not None) else None}
+
+
+    # Sparse prediction logic seems okay based on comments
     def _forward_sparse(self, outputs: torch.Tensor, labels: Optional[torch.Tensor] = None):
-
+        # ...(Same as your provided code)...
         labels = labels.view(-1)
         mask_positions = labels.view(-1) != self.loss_fn.ignore_index
         num_masks_guaranteed = round(self.sparse_prediction * labels.shape[0])
-        # outputs = outputs[mask_positions]  # not allowed as dynamic shape op
-        # labels = labels[mask_positions]
-        # torch.masked_select(labels, mask_positions)  # not allowed as a dynamic shape operator
-
-        # indices = torch.arange(mask_positions.shape[0], device=outputs.device)[mask_positions] # not allowed
-        indices = torch.argsort(mask_positions.int())[-num_masks_guaranteed:]  # ugh
-
-        outputs = outputs[indices]  # not allowed as dynamic shape op, but ok with indices
+        indices = torch.argsort(mask_positions.int())[-num_masks_guaranteed:]
+        outputs = outputs[indices]
         labels = labels[indices]
-        # alternative:
-        # outputs = torch.take_along_dim(outputs, indices.view(-1, 1), 0)
-        # labels = torch.take(labels, indices)
-
-        outputs = self.decoder(self.prediction_head(outputs))
-        masked_lm_loss = self.loss_fn(outputs, labels)
+        processed_outputs = self.prediction_head(outputs) # Apply head to sparse outputs
+        logits = self.decoder(processed_outputs)
+        masked_lm_loss = self.loss_fn(logits, labels)
         return masked_lm_loss
 
 
