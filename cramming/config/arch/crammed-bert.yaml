@@ -62,7 +62,8 @@ attention:
   static_seq_len: 128      # pre‑build LMA once for this sequence length
   num_heads_latent: 12     # heads inside each latent block
   num_blocks: 1            # how many latent transformer blocks per layer (we need better convetion for this)
-  ff_latent_hidden: 1536   # inner size of the latent MLP (≈ 4 × d_new)
+  #ff_latent_hidden: 1536   # inner size of the latent MLP (≈ 4 × d_new) (maybe?)
+  ff_latent_hidden: 3072   # lets try to keep this the same as normal BERT
 
   # ───────────── misc options ─────────────
   rotary_embedding: False
