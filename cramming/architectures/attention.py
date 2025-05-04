@@ -68,9 +68,8 @@ class _LatentAttentionInternal(torch.nn.Module):
         self.c_attn  = torch.nn.Linear(d_new, 3 * d_new, bias=bias) # Input proj to QKV
         self.c_proj  = torch.nn.Linear(d_new, d_new, bias=bias) # Output projection
         self.at_drop = torch.nn.Dropout(dropout)
-        # NOTE: Removed self.res_drop, dropout is handled in the main block now
 
-    def forward(self, z_normed, mask: Optional[torch.Tensor] = None):
+    def forward(self, z_normed, mask: Optional[torch.Tensor] = None): # mask is [B, L] boolean, True=PAD
         # Input z_normed is ALREADY LayerNormed
         B, L, _ = z_normed.shape
         q, k, v = self.c_attn(z_normed).chunk(3, dim=-1)            # [B,L,d_new]×3
@@ -79,17 +78,28 @@ class _LatentAttentionInternal(torch.nn.Module):
         v = v.view(B, L, self.nh, self.dk).transpose(1, 2)
 
         # ----- Attention computation -----
-        # Correction: Use SDPA with key_padding_mask when mask is available
         if self.flash:
-            # Note: SDPA needs boolean mask where True indicates padding/masking
-            attn_mask_bool = mask if mask is not None else None
+            # Create the attention mask for SDPA from the boolean latent_mask
+            sdpa_attn_mask = None
+            if mask is not None:
+                # SDPA attn_mask needs to be broadcastable to [B, nh, L, L].
+                # Shape [B, 1, 1, L] works for padding keys.
+                # Bool: True means MASK this position. Float: -inf means MASK.
+                # Use boolean mask directly if supported, otherwise convert to float.
+                # Note: Check your PyTorch version; earlier versions might prefer float masks.
+                # Let's create the float mask for broader compatibility.
+                sdpa_attn_mask = torch.zeros(B, 1, 1, L, device=z_normed.device, dtype=q.dtype)
+                # Expand boolean mask to the target shape for masked_fill
+                mask_expanded = mask.unsqueeze(1).unsqueeze(2) # [B, 1, 1, L]
+                # Fill with -inf where the boolean mask is True (padding)
+                sdpa_attn_mask = sdpa_attn_mask.masked_fill(mask_expanded, float("-inf"))
+
+            # --- Call SDPA ---
             y = torch.nn.functional.scaled_dot_product_attention(
                     q, k, v,
-                    attn_mask=None, # Not needed for standard padding
+                    attn_mask=sdpa_attn_mask, # Use the attn_mask argument
                     dropout_p=self.at_drop.p if self.training else 0.0,
-                    is_causal=False,
-                    # Use key_padding_mask
-                    #key_padding_mask=attn_mask_bool
+                    is_causal=False
                     )
         else: # Manual path
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.dk))
@@ -103,8 +113,7 @@ class _LatentAttentionInternal(torch.nn.Module):
         # Reassemble heads and apply output projection
         y = y.transpose(1, 2).reshape(B, L, self.d_new) # [B,L,d_new]
         attn_output = self.c_proj(y) # Apply final projection
-        return attn_output # Return projected attention output, NO residual/dropout here
-
+        return attn_output # Return projected attention output
 class _LatentMLPInternal(torch.nn.Module):
     """
     INTERNAL LMA component: Feed‑forward network in latent space.
