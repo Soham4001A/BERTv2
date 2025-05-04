@@ -191,7 +191,8 @@ class ScriptableLM(PreTrainedModel):
         self.use_causal_attention = self.cfg.attention.causal_attention
 
         if self.cfg.final_norm:
-            self.final_norm = _get_norm_fn(self.cfg.norm)(self.cfg.hidden_size, eps=self.cfg.norm_eps)
+            latent_dim = int(self.cfg.attention.d_new)
+            self.final_norm = _get_norm_fn(self.cfg.norm)(latent_dim, eps=self.cfg.norm_eps)
         else:
             self.final_norm = torch.nn.Identity()
 
