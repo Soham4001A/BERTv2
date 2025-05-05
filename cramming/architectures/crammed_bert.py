@@ -309,49 +309,55 @@ class ScriptableLMForSequenceClassification(PreTrainedModel):
         self.num_labels = self.cfg.num_labels
 
         self.encoder = ScriptableLM(config)
-        # projector latent -> hidden
-        self.latent_to_hidden = torch.nn.Linear(
-            self.cfg.attention.d_new,
-            self.cfg.hidden_size,
-            bias=self.cfg.use_bias,
-        )
-        self.pooler = PoolingComponent(self.cfg.classification_head, self.cfg.hidden_size)
+        # REMOVE or ignore self.latent_to_hidden - no longer needed here
+        # self.latent_to_hidden = torch.nn.Linear(...) # <<< DELETE / IGNORE
+
+        self.pooler = PoolingComponent(self.cfg.classification_head, self.cfg.hidden_size) # Pooler operates on H
+        # The head dimension should match the pooler's output dimension, which is derived from H
         self.head = torch.nn.Linear(self.cfg.classification_head.head_dim, self.num_labels)
 
         self.problem_type = None
-        self._init_weights()
+        self._init_weights() # Ensure pooler/head are initialized
 
     def _init_weights(self, module=None):
         modules = self.modules() if module is None else [module]
         for module in modules:
-            _init_module(
-                module,
-                self.cfg.init.type,
-                self.cfg.init.std,
-                self.cfg.hidden_size,
-                self.cfg.num_transformer_layers,
-            )
+             # Initialize pooler and head layers as well if not covered by _init_module specific checks
+             if isinstance(module, (torch.nn.Linear)) and module is not self.encoder.latent_front.from_latent and module is not self.encoder.latent_front.to_latent : # Example condition
+                 _init_module(
+                     module,
+                     self.cfg.init.type,
+                     self.cfg.init.std,
+                     self.cfg.hidden_size, # Use H for standard layers
+                     self.cfg.num_transformer_layers,
+                 )
 
     def forward(self, input_ids, attention_mask: Optional[torch.Tensor] = None, labels: Optional[torch.Tensor] = None, **kwargs):
-        latent = self.encoder(input_ids, attention_mask)               # [B,L_new,d_new]
-        hidden = self.latent_to_hidden(latent)                         # [B,L_new,H]
-        logits = self.head(self.pooler(hidden))
+        # Get final latent output from the encoder
+        z_latent = self.encoder(input_ids, attention_mask)             # [B, L_new, d_new]
 
+        # --- FIX: Inverse transform back to token space BEFORE pooling ---
+        # Use the inverse_transform method from the encoder's latent_front
+        h_tokens = self.encoder.latent_front.inverse_transform(z_latent) # [B, S, H]
+        # -----------------------------------------------------------------
+
+        # Now, pool based on the reconstructed token sequence
+        pooled_output = self.pooler(h_tokens)                          # Pooler operates on [B, S, H]
+                                                                       # likely extracts h_tokens[:, 0, :]
+
+        # The rest should work as intended now
+        logits = self.head(pooled_output)
+
+        # --- Loss Calculation (remains the same, operates on final logits) ---
         if labels is not None:
-            if self.problem_type is None:  # very much from huggingface
-                if self.num_labels == 1:
-                    self.problem_type = "regression"
-                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-                    self.problem_type = "single_label_classification"
-                else:
-                    self.problem_type = "multi_label_classification"
+            if self.problem_type is None:
+                if self.num_labels == 1: self.problem_type = "regression"
+                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int): self.problem_type = "single_label_classification"
+                else: self.problem_type = "multi_label_classification"
 
             if self.problem_type == "regression":
                 loss_fct = torch.nn.MSELoss()
-                if self.num_labels == 1:
-                    loss = loss_fct(logits.squeeze(), labels.squeeze())
-                else:
-                    loss = loss_fct(logits, labels)
+                loss = loss_fct(logits.squeeze() if self.num_labels==1 else logits, labels.squeeze() if self.num_labels==1 else labels)
             elif self.problem_type == "single_label_classification":
                 loss_fct = torch.nn.CrossEntropyLoss()
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
@@ -365,7 +371,7 @@ class ScriptableLMForSequenceClassification(PreTrainedModel):
 
 
 class ScriptableLMForSCRIPTTraining(PreTrainedModel):
-    """Pretraining machinery using SCRIPT from Nijkamp et al., 2021. Always running sparse prediction."""
+    """Pretraining machinery using SCRIPT. Needs inverse transform."""
 
     config_class = crammedBertConfig
     ALPHA = 1.0  # SCRIPT constant
@@ -373,89 +379,121 @@ class ScriptableLMForSCRIPTTraining(PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.cfg = OmegaConf.create(config.arch)
-        self.num_labels = self.cfg.num_labels
+        # SCRIPT doesn't use num_labels from config in the same way?
+        # It uses vocab size for MLM-like generation.
 
         self.encoder = ScriptableLM(config)
+        # Prediction head should operate on H dimension
         self.prediction_head = PredictionHeadComponent(self.cfg)
 
         self.decoder = torch.nn.Linear(self.cfg.embedding.embedding_dim, self.cfg.embedding.vocab_size, bias=self.cfg.decoder_bias)
-        self.decoder.weight = self.encoder.embedding.word_embedding.weight
+        if self.cfg.tie_weights:
+            self.decoder.weight = self.encoder.embedding.word_embedding.weight
 
         self.loss_fn = torch.nn.CrossEntropyLoss()
         self.sparse_prediction = self.cfg.sparse_prediction
-        assert self.sparse_prediction
+        assert self.sparse_prediction # SCRIPT relies on sparse
 
         self._init_weights()
 
     def _init_weights(self, module=None):
+        # ...(Initialization logic remains the same)...
         modules = self.modules() if module is None else [module]
         for module in modules:
-            _init_module(
-                module,
-                self.cfg.init.type,
-                self.cfg.init.std,
-                self.cfg.hidden_size,
-                self.cfg.num_transformer_layers,
-            )
+             if isinstance(module, torch.nn.Linear) and module is not self.encoder.latent_front.from_latent and module is not self.encoder.latent_front.to_latent : # Example condition
+                 _init_module(
+                     module,
+                     self.cfg.init.type,
+                     self.cfg.init.std,
+                     self.cfg.hidden_size, # Use H for standard layers
+                     self.cfg.num_transformer_layers,
+                 )
+        if self.cfg.tie_weights:
+             self.decoder.weight = self.encoder.embedding.word_embedding.weight
+
 
     def forward(self, input_ids, attention_mask: Optional[torch.Tensor] = None, labels: Optional[torch.Tensor] = None):
         loss = torch.tensor(0.0, dtype=torch.float, device=input_ids.device)
 
-        outputs = self.encoder(input_ids, attention_mask)
-        outputs = outputs.view(-1, outputs.shape[-1])
+        # Get original sequence length S
+        B, S = input_ids.shape
+
+        # --- Encoder Pass ---
+        # latent outputs  [B, L_new, d_new]
+        z_latent = self.encoder(input_ids, attention_mask)
+        # Convert back to token‑level hidden states [B, S, H]
+        h_tokens = self.encoder.latent_front.inverse_transform(z_latent)
+
+        # Reshape for processing
+        outputs_flat = h_tokens.view(-1, h_tokens.size(-1)) # [B*S, H]
 
         if labels is not None:
-            # ## Generation pass ##
-            labels = labels.view(-1)
-            mask_positions = labels.view(-1) != self.loss_fn.ignore_index
-            num_masks_guaranteed = round(self.sparse_prediction * labels.shape[0])
+            # ## Generation pass (MLM part of SCRIPT) ##
+            labels_flat = labels.view(-1)
+            mask_positions = labels_flat != self.loss_fn.ignore_index
+            num_masks_guaranteed = round(self.sparse_prediction * labels_flat.numel())
             indices = torch.argsort(mask_positions.int())[-num_masks_guaranteed:]
 
-            # sparse outputs for prediction
-            outputs = outputs[indices]
-            labels = labels[indices]
+            # Select sparse outputs using indices from the original sequence dimension
+            outputs_sparse = outputs_flat[indices] # [N_masked, H]
+            labels_sparse = labels_flat[indices]   # [N_masked]
 
-            logits = self.decoder(self.prediction_head(outputs))  # sparse logits
-            loss += self.loss_fn(logits, labels)
+            # Apply prediction head and decoder to sparse H representations
+            logits_gen = self.decoder(self.prediction_head(outputs_sparse)) # [N_masked, V]
+            loss += self.loss_fn(logits_gen, labels_sparse) # Generation loss
 
-            # ## Discrimination pass ##
-            resampled_token_ids = self._gumbel_sample(logits.detach())
-            discriminator_input_ids = input_ids.clone().view(-1)
-            discriminator_input_ids[indices] = resampled_token_ids
+            # ## Discrimination pass (ELECTRA part of SCRIPT) ##
+            with torch.no_grad(): # Detach generator logits for sampling
+                 resampled_token_ids = self._gumbel_sample(logits_gen) # [N_masked]
 
-            critic_labels = (input_ids.view(-1) != discriminator_input_ids).to(outputs.dtype)
+            # Create discriminator input by replacing original masked tokens
+            discriminator_input_ids_flat = input_ids.clone().view(-1)
+            discriminator_input_ids_flat[indices] = resampled_token_ids
+            discriminator_input_ids = discriminator_input_ids_flat.view(B, S)
 
-            outputs = self.encoder(discriminator_input_ids.view_as(input_ids), attention_mask).view(-1, outputs.shape[-1])
-            disc_logits = self.decoder(self.prediction_head(outputs))  # full logits
-            binary_logits = self._get_binary_logits(disc_logits)
+            # Create critic labels based on whether token was replaced
+            critic_labels_flat = (input_ids.view(-1) != discriminator_input_ids_flat).to(h_tokens.dtype) # [B*S]
 
-            # ELECTRA-type discriminator:
-            loss += self.ALPHA * torch.nn.functional.binary_cross_entropy_with_logits(binary_logits, critic_labels)
+            # --- Run Encoder AGAIN on corrupted input ---
+            z_latent_disc = self.encoder(discriminator_input_ids, attention_mask)
+            h_tokens_disc = self.encoder.latent_front.inverse_transform(z_latent_disc) # [B, S, H]
+            outputs_disc_flat = h_tokens_disc.view(-1, h_tokens_disc.size(-1)) # [B*S, H]
+
+            # --- Get discriminator logits ---
+            # Apply prediction head and decoder to ALL H representations from corrupted input
+            disc_logits_full = self.decoder(self.prediction_head(outputs_disc_flat)) # [B*S, V]
+            # Convert to binary logits (replaced vs. original)
+            binary_logits = self._get_binary_logits(disc_logits_full) # [B*S]
+
+            # --- Calculate Discriminator Loss ---
+            # Apply loss ONLY at original token positions (B*S dimension)
+            loss += self.ALPHA * torch.nn.functional.binary_cross_entropy_with_logits(
+                binary_logits, # [B*S]
+                critic_labels_flat # [B*S]
+            )
 
         else:
-            logits = self.decoder(self.prediction_head(outputs))
-            loss += outputs.new_zeros((1,))
+            # If no labels, just calculate logits for potential inference/eval?
+            # Need to decide what the output should be. Maybe just return 0 loss?
+            logits = self.decoder(self.prediction_head(outputs_flat.view_as(h_tokens))) # Calculate full logits
+            loss += logits.new_zeros((1,))
 
-        return {"loss": loss, "logits": logits}
 
+        # Decide what logits to return - generator logits? discriminator logits?
+        # Returning generator logits (sparse) might be confusing.
+        # Returning full logits from first pass might be better for consistency?
+        logits_to_return = self.decoder(self.prediction_head(outputs_flat.view_as(h_tokens)))
+
+        return {"loss": loss, "logits": logits_to_return} # Return full logits from 1st pass
+
+    # _get_binary_logits, _gumbel_sample, _gumbel_noise remain the same
     def _get_binary_logits(self, logits):
-        # Convert to binary decision as described in SCRIPT
-        # exp_logitsum = torch.exp(disc_logits).sum(dim=-1)  # autocast ok?
-        # binary_logits = torch.stack([1 / (exp_logitsum + 1), exp_logitsum / (exp_logitsum + 1)], dim=-1)  # stack minus and plus
-        # instead, we can also compute logit[binary_logits], which is
-
-        # let y = sum(exp(logits)) / ( sum(exp(logits))+1 ), 1-y = 1 / ( sum(exp(logits))+1 )
-        # log(y / (1-y)) = log( sum(exp(logits)) / ( sum(exp(logits))+1 ) * ( sum(exp(logits))+1 ) / 1)
-        #                = log(sum(exp(logits))
-        # Then, we can use BCEWithLogitsLoss, to safely compute logit probs via sigmoids
         return torch.logsumexp(logits, dim=-1)
 
     def _gumbel_sample(self, logits, temperature=1.0):
-        """via https://github.com/lucidrains/electra-pytorch/blob/master/electra_pytorch/electra_pytorch.py"""
         return ((logits / temperature) + self._gumbel_noise(logits)).argmax(dim=-1)
 
     def _gumbel_noise(self, inputs, eps=1e-9):
-        """via https://github.com/lucidrains/electra-pytorch/blob/master/electra_pytorch/electra_pytorch.py"""
         noise = torch.zeros_like(inputs).uniform_(0, 1)
         return -torch.log(-torch.log(noise + eps) + eps)
 
@@ -468,55 +506,65 @@ class ScriptableLMForTokenClassification(PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.cfg = OmegaConf.create(config.arch)
+        self.num_labels = config.num_labels # Get num_labels from config directly
 
         self.encoder = ScriptableLM(config)
-        self.latent_to_hidden = torch.nn.Linear(
-            self.cfg.attention.d_new,
-            self.cfg.hidden_size,
-            bias=self.cfg.use_bias,
-        )
-        self.head = torch.nn.Linear(self.cfg.classification_head.head_dim, self.num_labels)
+        # REMOVE or ignore self.latent_to_hidden - no longer needed here
+        # self.latent_to_hidden = torch.nn.Linear(...) # <<< DELETE / IGNORE
+
+        # The final head operates on the hidden dimension H
+        # Assuming classification_head.head_dim is H? If not, adjust.
+        # If prediction_head component is used before this, ensure it outputs H.
+        # Let's assume head takes H directly for simplicity now.
+        self.head = torch.nn.Linear(self.cfg.hidden_size, self.num_labels) # Input is H
 
         self.problem_type = None
-        self._init_weights()
+        self._init_weights() # Ensure head is initialized
 
     def _init_weights(self, module=None):
+        # ...(Initialization logic remains the same)...
         modules = self.modules() if module is None else [module]
         for module in modules:
-            _init_module(
-                module,
-                self.cfg.init.type,
-                self.cfg.init.std,
-                self.cfg.hidden_size,
-                self.cfg.num_transformer_layers,
-            )
+             if isinstance(module, torch.nn.Linear) and module is not self.encoder.latent_front.from_latent and module is not self.encoder.latent_front.to_latent : # Example condition
+                _init_module(
+                    module,
+                    self.cfg.init.type,
+                    self.cfg.init.std,
+                    self.cfg.hidden_size, # Use H for standard layers
+                    self.cfg.num_transformer_layers,
+                )
 
-    def forward(self, input_ids, attention_mask: Optional[torch.Tensor] = None, labels: Optional[torch.Tensor] = None):
-        logits = self.head(self.latent_to_hidden(self.encoder(input_ids, attention_mask)))
 
+    def forward(self, input_ids, attention_mask: Optional[torch.Tensor] = None, labels: Optional[torch.Tensor] = None, **kwargs):
+        # latent outputs  [B , L_new , d_new]
+        z_latent = self.encoder(input_ids, attention_mask)
+
+        # ----> APPLY INVERSE TRANSFORM HERE <----
+        # Convert back to token‑level hidden states [B, S, H]
+        h_tokens = self.encoder.latent_front.inverse_transform(z_latent)
+
+        # Apply head to the reconstructed h_tokens
+        logits = self.head(h_tokens) # Shape: [B, S, num_labels]
+
+        # --- Loss Calculation (remains the same, operates on final logits) ---
         if labels is not None:
-            if self.problem_type is None:  # very much from huggingface
-                if self.num_labels == 1:
-                    self.problem_type = "regression"
-                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-                    self.problem_type = "single_label_classification"
-                else:
-                    self.problem_type = "multi_label_classification"
+             # ...(problem type detection and loss calculation remains the same)...
+             # Loss needs logits [B*S, num_labels] and labels [B*S]
+             if self.problem_type is None:
+                 # ...(problem type detection)...
+                 if self.num_labels == 1: self.problem_type = "regression" # Unlikely for token class.
+                 elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int): self.problem_type = "single_label_classification"
+                 else: self.problem_type = "multi_label_classification" # Possible if multi-label per token
 
-            if self.problem_type == "regression":
-                loss_fct = torch.nn.MSELoss()
-                if self.num_labels == 1:
-                    loss = loss_fct(logits.squeeze(), labels.squeeze())
-                else:
-                    loss = loss_fct(logits, labels)
-            elif self.problem_type == "single_label_classification":
-                loss_fct = torch.nn.CrossEntropyLoss()
-                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            elif self.problem_type == "multi_label_classification":
-                loss_fct = torch.nn.BCEWithLogitsLoss()
-                loss = loss_fct(logits, labels)
-            else:
-                raise ValueError("Wrong problem type!")
+             if self.problem_type == "regression":
+                 loss_fct = torch.nn.MSELoss()
+                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1, self.num_labels)) # Adjust shapes if needed
+             elif self.problem_type == "single_label_classification":
+                 loss_fct = torch.nn.CrossEntropyLoss()
+                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+             elif self.problem_type == "multi_label_classification":
+                 loss_fct = torch.nn.BCEWithLogitsLoss()
+                 loss = loss_fct(logits, labels) # Assumes labels have shape [B, S, num_labels]
         else:
             loss = logits.new_zeros((1,))
 

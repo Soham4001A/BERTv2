@@ -8,6 +8,7 @@ from typing import Optional
 from einops.layers.torch import Rearrange
 from einops import rearrange
 import math # Make sure math is imported
+import warnings
 
 # ────────────────────────────────────────────────────────────────────────────
 # Latent Meta Attention – NLP variant
@@ -76,6 +77,14 @@ class _LatentAttentionInternal(torch.nn.Module):
         q = q.view(B, L, self.nh, self.dk).transpose(1, 2)          # [B,nh,L,dk]
         k = k.view(B, L, self.nh, self.dk).transpose(1, 2)
         v = v.view(B, L, self.nh, self.dk).transpose(1, 2)
+
+        # Zero out pad positions in Q, K, V so they do not contribute to attention
+        if mask is not None:
+            # mask: [B, L] boolean, True = PAD
+            pad_mask = mask.unsqueeze(1).unsqueeze(-1)  # [B, 1, L, 1]
+            q = q.masked_fill(pad_mask, 0.0)
+            k = k.masked_fill(pad_mask, 0.0)
+            v = v.masked_fill(pad_mask, 0.0)
 
         # ----- Attention computation -----
         if self.flash:
@@ -226,6 +235,12 @@ class LMABertAttention(torch.nn.Module):
         """
         Implements the full LMA block logic internally, including latent residuals.
         """
+        if attention_mask is None:
+            warnings.warn(
+                "LMABertAttention received no attention_mask: padding positions will not be masked. "
+                "Please provide attention_mask to avoid potential contamination.",
+                UserWarning,
+            )
         B, S, H = hidden_states.shape
 
         # --- 1. Build if needed ---

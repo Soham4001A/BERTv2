@@ -11,6 +11,7 @@ from collections import defaultdict
 
 import cramming
 import evaluate
+from safetensors.torch import load_file as safe_load
 
 
 log = logging.getLogger(__name__)
@@ -31,8 +32,66 @@ def main_downstream_process(cfg, setup):
         log.info(f"Finetuning task {task_name} with {task['num_classes']} classes for {cfg.eval.steps} steps.")
         # Prepare model for finetuning:
         model = cramming.construct_model(cfg_arch, tokenizer.vocab_size, downstream_classes=task["num_classes"])
-        model_engine, _, _, _ = cramming.load_backend(model, None, tokenizer, cfg.eval, cfg.impl, setup=setup)
-        model_engine.load_checkpoint(cfg_arch, model_file)
+        # ------------------------------------------------------------------
+        # Build backend *first*, then load only the encoder weights from the
+        # pre‑training checkpoint (ignore MLM‑specific layers).  Afterwards
+        # create a brand‑new optimiser / scheduler suitable for fine‑tuning
+        # so the learning‑rate never collapses to zero.
+        # ------------------------------------------------------------------
+        model_engine, _, _, _ = cramming.load_backend(
+            model, None, tokenizer, cfg.eval, cfg.impl, setup=setup
+        )
+
+        # ---- selective checkpoint loading --------------------------------
+        # PyTorch ≥ 2.6 sets `weights_only=True` by default which breaks loading
+        # checkpoints that contain additional metadata.  Explicitly request the
+        # previous behaviour.
+        ckpt_state = None
+        load_errors = []
+        for attempt in ("torch_weights_only", "safetensors", "torch_legacy"):
+            try:
+                if attempt == "torch_weights_only":
+                    ckpt_state = torch.load(model_file, map_location="cpu", weights_only=True)
+                elif attempt == "safetensors":
+                    ckpt_state = safe_load(model_file)
+                elif attempt == "torch_legacy":
+                    ckpt_state = torch.load(model_file, map_location="cpu", weights_only=False, pickle_module=pickle)
+                break  # success
+            except Exception as e:
+                load_errors.append((attempt, repr(e)))
+                ckpt_state = None
+        if ckpt_state is None:
+            raise RuntimeError(
+                f"Failed to load checkpoint {model_file}. Tried: {load_errors}"
+            )
+        # Torch‑style checkpoints wrap weights in dict key 'model'; safetensors is already flat.
+        if "model" in ckpt_state and isinstance(ckpt_state["model"], dict):
+            ckpt_state = ckpt_state["model"]
+        encoder_state = {
+            k: v
+            for k, v in ckpt_state.items()
+            if not k.startswith(("decoder", "latent_to_hidden")) and k in model.state_dict()
+        }
+        missing, unexpected = model.load_state_dict(encoder_state, strict=False)
+        log.info(
+            f"Loaded encoder weights.  Missing: {len(missing)} tensors, "
+            f"Ignored: {len(unexpected)} tensors."
+        )
+
+        # ---- fine‑tune optimiser & scheduler -----------------------------
+        num_training_steps = len(task["trainloader"]) * cfg.eval.epochs
+        ft_lr = getattr(cfg.eval, "finetune_lr", 2e-5)          # default 2e‑5
+        optimizer = torch.optim.AdamW(
+            (p for p in model.parameters() if p.requires_grad),
+            lr=ft_lr,
+            weight_decay=0.01,
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=num_training_steps
+        )
+
+        model_engine.optimizer = optimizer
+        model_engine.scheduler = scheduler
 
         try:
             assert task_name != "record"

@@ -1,5 +1,6 @@
 # latent.py  (NEW FILE)
 import torch, math
+import warnings
 from typing import Optional
 from .attention import _LayerNorm, _LatentAttentionInternal, _LatentMLPInternal, _find_closest_divisor
 
@@ -58,6 +59,12 @@ class InitialLatentTransform(torch.nn.Module):
                 f"fixed length or rebuild the model with the desired length."
             )
 
+        if mask is None:
+            warnings.warn(
+                "InitialLatentTransform received no mask: padding positions will not be zeroed. "
+                "Please provide mask to avoid potential contamination.",
+                UserWarning,
+            )
         if mask is not None:             x = x * mask.unsqueeze(-1)  # zero PAD
 
         # head‑stack
