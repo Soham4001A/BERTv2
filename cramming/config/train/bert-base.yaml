@@ -4,8 +4,12 @@
 name: bert-base
 
 defaults:
-  - optim: adam
+  - optim: DAG
   - optim_mod: disabled
+
+optim:
+  lr: 7e-4
+  weight_decay: 0.01
 
 limited_decay_keys: [bias, LayerNorm.bias, LayerNorm.weight, norm] # no weight decay for these layers
 

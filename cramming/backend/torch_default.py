@@ -123,21 +123,6 @@ class TorchEngineMinimal(torch.nn.Module):
         with context():
             loss = self.forward(**batch)["loss"]
             self.backward(loss)
-            # Debug gradients after backward
-            for name, param in self.named_parameters():
-                if param.requires_grad:
-                    if param.grad is None:
-                        print(f"WARNING: Grad is None for {name}")
-                    else:
-                        grad_norm = param.grad.norm().item()
-                        is_nan = torch.isnan(param.grad).any().item()
-                        is_inf = torch.isinf(param.grad).any().item()
-                        if is_nan or is_inf or grad_norm > 1000:
-                            print(f"Problematic grad for {name}: norm={grad_norm}, NaN={is_nan}, Inf={is_inf}")
-                        # Optional: near-zero head/pooler grads
-                        if name.startswith("pooler.") or name.startswith("head."):
-                            if grad_norm < 1e-9:
-                                print(f"WARNING: Near-zero grad for {name}: {grad_norm}")
             self.optimizer_step()
         return loss.detach()
 
